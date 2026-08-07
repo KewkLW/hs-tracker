@@ -1,0 +1,1380 @@
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::parser::GameEvent;
+
+pub const CURRENT_SEASON: i64 = 9;
+
+pub const RARITIES: &[(&str, &str)] = &[
+    ("1", "Common"),
+    ("2", "Superior"),
+    ("3", "Rare"),
+    ("4", "Set"),
+    ("5", "Mythic"),
+    ("6", "Satanic"),
+    ("7", "Angelic"),
+    ("8", "Blessed"),
+    ("9", "Heroic"),
+    ("10", "Unholy"),
+];
+
+pub const JOURNAL_RARITIES: &[&str] = &["Satanic", "Set", "Heroic", "Angelic", "Unholy"];
+
+// stack resources by item type
+const RESOURCES: &[(i64, &str)] = &[(12, "keys"), (13, "collectibles"), (14, "materials"), (15, "socketables")];
+
+/// Drops worth their own counter, matched by resolved item name. The rune
+/// groups follow the game's own grades — S is Qi through Zed, SS is the four
+/// level-100 runes. Override the whole list in settings.json if the game
+/// regrades anything.
+pub fn default_notable() -> Vec<(String, Vec<String>)> {
+    let group = |label: &str, names: &[&str]| {
+        (label.to_string(), names.iter().map(|n| n.to_lowercase()).collect())
+    };
+    vec![
+        group("Angelic Key", &["Angelic Key"]),
+        group("Satanic Key", &["Satanic Key"]),
+        group("Satanic Dice", &["Satanic Dice"]),
+        group("S runes", &["Qi", "Xo", "Sur", "Ber", "Jah", "Drax", "Zed"]),
+        group("SS runes", &["Fawn", "Flo", "Nju", "Jol"]),
+    ]
+}
+
+#[derive(Clone, Serialize)]
+pub struct NotableCount {
+    pub label: String,
+    pub total: i64,
+}
+const JOURNAL_CAP: usize = 400;
+const SERIES_CAP: usize = 4000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Default, Clone, Serialize)]
+pub struct ItemCount {
+    pub total: i64,
+    pub mf: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SatanicZone {
+    pub zone: String,
+    pub buffs: Vec<u8>,
+    pub debuffs: Vec<u8>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CharacterInfo {
+    pub name: String,
+    pub level: i64,
+    pub herolevel: i64,
+    pub difficulty: i64,
+    pub hardcore: bool,
+    pub season: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DropEntry {
+    pub ts_ms: u64,
+    pub rarity: String,
+    pub mf: bool,
+    pub tier: i64,
+    pub item_type: i64,
+    pub item_id: i64,
+    pub weapon_type: i64,
+    pub seed: i64,
+    pub name: String,
+    pub announced: bool,
+    pub ground: bool,
+    pub zone: Option<String>,
+    /// which alert to play, decided here so the announcement, the drop and the
+    /// pickup of one item cannot chime three times
+    pub sound: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct SeriesPoint {
+    pub t: u64,
+    pub gold: i64,
+    pub xp: i64,
+}
+
+#[derive(Serialize)]
+pub struct SessionRecord {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub secs: u64,
+    pub gold: i64,
+    pub xp: i64,
+    pub items: HashMap<String, i64>,
+    pub mf: i64,
+}
+
+pub struct GameStats {
+    pub(crate) start: Instant,
+    start_ms: u64,
+    has_mail: bool,
+    total_gold: i64,
+    gold_earned: i64,
+    total_xp: i64,
+    xp_earned: i64,
+    total_kills: i64,
+    kills_earned: i64,
+    items: HashMap<&'static str, ItemCount>,
+    resources: HashMap<&'static str, i64>,
+    satanic: Option<SatanicZone>,
+    sz_changed: Option<Instant>,
+    season_mode: Option<&'static str>,
+    gold_mode: Option<&'static str>,
+    last_currency: Option<crate::parser::Currency>,
+    xp_authoritative: bool,
+    /// totals restored from the last run: the next packet of that kind
+    /// re-anchors on them instead of counting the difference as earned
+    stale_bank: bool,
+    /// gold counted from a deposit and not yet seen in a balance
+    banked: i64,
+    stale_save: bool,
+    last_save: Option<Instant>,
+    last_bank: Option<Instant>,
+    prefer_ground: bool,
+    alerts: Vec<String>,
+    min_tier: i64,
+    notable_defs: Vec<(String, Vec<String>)>,
+    notable: HashMap<String, i64>,
+    seen_fingerprints: std::collections::HashSet<String>,
+    /// tier by item hash, so the pickup of an item knows what the drop said
+    tier_seen: HashMap<String, i64>,
+    /// items already added to the counters, by identity
+    counted: std::collections::HashSet<String>,
+    announced_at: HashMap<String, Instant>,
+    character: Option<CharacterInfo>,
+    drops: VecDeque<DropEntry>,
+    series: Vec<SeriesPoint>,
+    activity: u64,
+    taken_activity: u64,
+    /// bumped by every change, so the pusher can skip unchanged snapshots
+    revision: u64,
+}
+
+impl Default for GameStats {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            start_ms: now_ms(),
+            has_mail: false,
+            total_gold: 0,
+            gold_earned: 0,
+            total_xp: 0,
+            xp_earned: 0,
+            total_kills: 0,
+            kills_earned: 0,
+            items: RARITIES.iter().map(|(_, name)| (*name, ItemCount::default())).collect(),
+            resources: RESOURCES.iter().map(|(_, name)| (*name, 0)).collect(),
+            satanic: None,
+            sz_changed: None,
+            season_mode: None,
+            gold_mode: None,
+            last_currency: None,
+            xp_authoritative: false,
+            stale_bank: false,
+            banked: 0,
+            stale_save: false,
+            last_save: None,
+            last_bank: None,
+            prefer_ground: true,
+            alerts: JOURNAL_RARITIES.iter().map(|r| r.to_string()).collect(),
+            min_tier: 0,
+            notable_defs: default_notable(),
+            notable: HashMap::new(),
+            seen_fingerprints: std::collections::HashSet::new(),
+            tier_seen: HashMap::new(),
+            counted: std::collections::HashSet::new(),
+            announced_at: HashMap::new(),
+            character: None,
+            drops: VecDeque::new(),
+            series: Vec::new(),
+            activity: 0,
+            taken_activity: 0,
+            revision: 0,
+        }
+    }
+}
+
+impl GameStats {
+    /// Character, zone and the diff baselines survive a session reset — only
+    /// the earned counters restart, so the next packet still yields a diff.
+    pub fn reset(&mut self) {
+        let revision = self.revision;
+        let carry = (
+            self.character.take(),
+            self.satanic.take(),
+            self.sz_changed.take(),
+            self.season_mode.take(),
+            self.gold_mode.take(),
+            self.last_currency.take(),
+            self.total_gold,
+            self.total_xp,
+            self.total_kills,
+            self.xp_authoritative,
+            self.stale_bank,
+            self.stale_save,
+            self.prefer_ground,
+            std::mem::take(&mut self.alerts),
+            self.min_tier,
+            std::mem::take(&mut self.notable_defs),
+        );
+        *self = Self::default();
+        (
+            self.character,
+            self.satanic,
+            self.sz_changed,
+            self.season_mode,
+            self.gold_mode,
+            self.last_currency,
+            self.total_gold,
+            self.total_xp,
+            self.total_kills,
+            self.xp_authoritative,
+            self.stale_bank,
+            self.stale_save,
+            self.prefer_ground,
+            self.alerts,
+            self.min_tier,
+            self.notable_defs,
+        ) = carry;
+        self.revision = revision + 1;
+    }
+
+    /// Totals from the previous run, so a restart shows the last known bank
+    /// and experience instead of zeros until the game saves again.
+    pub fn restore(&mut self, carried: &Carried) {
+        if carried.gold > 0 {
+            self.total_gold = carried.gold;
+            self.gold_mode = carried.mode.as_deref().and_then(currency_mode);
+        }
+        self.total_xp = carried.xp.max(0);
+        self.xp_authoritative = carried.xp > 0;
+        self.total_kills = carried.kills.max(0);
+        self.stale_bank = carried.gold > 0;
+        self.stale_save = carried.xp > 0 || carried.kills > 0;
+    }
+
+    pub fn carried(&self) -> Carried {
+        Carried {
+            gold: self.total_gold,
+            mode: self.gold_mode.map(|m| m.to_string()),
+            xp: self.total_xp,
+            kills: self.total_kills,
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether notifications fire when an item hits the ground (true) or when
+    /// it is picked up (false).
+    pub fn set_prefer_ground(&mut self, prefer_ground: bool) {
+        self.revision += 1;
+        self.prefer_ground = prefer_ground;
+    }
+
+    /// Which drops are worth a sound and a ticker line. Counters ignore this —
+    /// statistics should stay complete even when alerts are narrowed down.
+    pub fn set_filter(&mut self, alerts: Vec<String>, min_tier: i64) {
+        self.revision += 1;
+        self.alerts = alerts;
+        self.min_tier = min_tier;
+    }
+
+    pub fn set_notable(&mut self, defs: Vec<(String, Vec<String>)>) {
+        self.revision += 1;
+        if !defs.is_empty() {
+            self.notable_defs = defs;
+        }
+    }
+
+    fn count_notable(&mut self, name: &str, amount: i64) {
+        if name.is_empty() {
+            return;
+        }
+        // the game calls a rune "Ber"; everyone else says "Ber Rune"
+        let lower = name.to_lowercase();
+        let bare = lower.trim_end_matches(" rune").to_string();
+        let label = self
+            .notable_defs
+            .iter()
+            .find(|(_, names)| {
+                names.iter().any(|n| *n == lower || n.trim_end_matches(" rune") == bare)
+            })
+            .map(|(label, _)| label.clone());
+        if let Some(label) = label {
+            *self.notable.entry(label).or_insert(0) += amount;
+        }
+    }
+
+    /// A minimum tier is a promise to stay quiet about anything lesser, so an
+    /// item whose grade cannot be established stays quiet too. The server's own
+    /// announcements bypass this — they are rare finds by definition.
+    fn passes_filter(&self, rarity: &str, tier: i64) -> bool {
+        self.alerts.iter().any(|r| r == rarity) && tier >= self.min_tier
+    }
+
+    /// Returns the journal entry when this event produced a new tracked drop.
+    pub fn apply(&mut self, event: &GameEvent) -> Option<DropEntry> {
+        self.revision += 1;
+        match event {
+            GameEvent::Gold(c) => self.apply_currency(c),
+            // guild XP is 15% of character XP, so the reported gain scales back
+            // up; account totals later correct any drift (their diff goes 0)
+            GameEvent::XpGain(xp) => {
+                let gained = (*xp as f64 / 0.15) as i64;
+                if gained > 0 {
+                    self.total_xp += gained;
+                    self.xp_earned += gained;
+                    self.activity += 1;
+                }
+            }
+            GameEvent::Account {
+                experience,
+                has_experience,
+                season,
+                hardcore,
+                blood_pact,
+                name,
+                level,
+                herolevel,
+                difficulty,
+                kills,
+            } => {
+                if *has_experience {
+                    self.last_save = Some(Instant::now());
+                }
+                if self.stale_save && *has_experience && *experience > 0 {
+                    self.total_xp = *experience;
+                    self.xp_authoritative = true;
+                    self.total_kills = *kills;
+                    self.stale_save = false;
+                } else if *has_experience && *experience > 0 {
+                    // only trust a diff between two authoritative totals; the
+                    // first one just calibrates (guild-XP guesses precede it)
+                    if self.xp_authoritative {
+                        let diff = experience - self.total_xp;
+                        if diff > 0 {
+                            self.xp_earned += diff;
+                        }
+                    }
+                    self.total_xp = *experience;
+                    self.xp_authoritative = true;
+                }
+                // The game rebases these statistics itself: after an instance
+                // restart a save can report fewer kills than the one before.
+                // Those monsters were still killed, so a lower total only
+                // moves the baseline — the counter never stalls waiting for
+                // the old peak to come back.
+                if *kills > 0 && self.total_kills != *kills {
+                    if self.total_kills != 0 {
+                        let diff = kills - self.total_kills;
+                        if diff > 0 {
+                            self.kills_earned += diff;
+                        }
+                    }
+                    self.total_kills = *kills;
+                }
+                // a login-identity packet carries no experience and may report
+                // a different season than the character actually plays, so it
+                // only fills in what the real account packet has not set yet
+                let full = *has_experience;
+                if full || self.season_mode.is_none() {
+                    self.season_mode = Some(if *season == CURRENT_SEASON {
+                        if *hardcore == 1 { "GSH" } else { "GSS" }
+                    } else if *blood_pact != 0 && *season == 0 {
+                        "GBP"
+                    } else if *hardcore == 1 {
+                        "GNH"
+                    } else {
+                        "GNS"
+                    });
+                }
+                if full || self.character.is_none() {
+                    self.character = Some(CharacterInfo {
+                        name: name.clone(),
+                        level: *level,
+                        herolevel: *herolevel,
+                        difficulty: *difficulty,
+                        hardcore: *hardcore == 1,
+                        season: *season,
+                    });
+                }
+                // currency usually arrives before the mode is known
+                if let Some(c) = self.last_currency.clone() {
+                    self.apply_currency(&c);
+                }
+            }
+            GameEvent::Mail(has) => self.has_mail = *has,
+            GameEvent::ItemAdded {
+                rarity,
+                mf,
+                tier,
+                item_type,
+                item_id,
+                weapon_type,
+                seed,
+                name,
+                announced,
+                amount,
+                fingerprint,
+                hash,
+                ground,
+            } => {
+                // One item is seen twice: when the server rolls it and when it
+                // lands in the bag. Its own hash ties the two together, so it
+                // counts once — and the tier the roll reported is remembered
+                // for the pickup, which never carries one.
+                let identity = if !hash.is_empty() {
+                    format!("h:{hash}")
+                } else if *ground {
+                    format!("g:{seed}:{item_type}:{item_id}")
+                } else {
+                    fingerprint.clone()
+                };
+                if !identity.is_empty() {
+                    // a world sync repeats the very same sighting; that is noise
+                    let sighting = format!("{}{identity}", if *ground { "d:" } else { "p:" });
+                    if !self.seen_fingerprints.insert(sighting) {
+                        return None;
+                    }
+                    if self.seen_fingerprints.len() > 20_000 {
+                        self.seen_fingerprints.clear();
+                        self.counted.clear();
+                    }
+                }
+                let first = identity.is_empty() || self.counted.insert(identity);
+                // A named item always drops at its own grade, which the packet
+                // never states — the wiki table does. Unnamed drops carry their
+                // grade themselves, and their pickup inherits it.
+                let mut tier = *tier;
+                if tier == 0 && !name.is_empty() {
+                    tier = crate::items::tier_by_name(name);
+                }
+                if !hash.is_empty() {
+                    if tier > 0 {
+                        self.tier_seen.insert(hash.clone(), tier);
+                    } else if let Some(known) = self.tier_seen.get(hash) {
+                        tier = *known;
+                    }
+                    if self.tier_seen.len() > 4000 {
+                        self.tier_seen.clear();
+                    }
+                }
+                let rarity_key = crate::parser::resolve_rarity(rarity, name);
+                let is_resource = RESOURCES.iter().any(|(t, _)| t == item_type);
+                // ground rolls are the drop moment, not an acquisition: they
+                // drive the ticker and sounds, never the counters
+                if !announced && first {
+                    let n = (*amount).max(1);
+                    if !is_resource {
+                        if let Some(count) = self.items.get_mut(rarity_key.as_str()) {
+                            count.total += n;
+                            if *mf {
+                                count.mf += n;
+                            }
+                            self.activity += 1;
+                        }
+                    }
+                    if let Some((_, res)) = RESOURCES.iter().find(|(t, _)| t == item_type) {
+                        *self.resources.get_mut(res).unwrap() += n;
+                        self.activity += 1;
+                    }
+                    self.count_notable(name, n);
+                }
+                // One notification per item: either when it hits the ground or
+                // when it lands in the bag, never both. The drop on the ground
+                // carries no tier — only the pickup does — so a minimum tier
+                // makes the alert wait for the pickup, which can prove it.
+                let wanted = if *announced {
+                    true
+                } else if self.prefer_ground {
+                    *ground
+                } else {
+                    !*ground
+                };
+                if wanted
+                    && (*announced || (!is_resource && self.passes_filter(&rarity_key, tier)))
+                {
+                    // The server announces a notable find in chat the moment
+                    // it drops — the only signal that arrives before the item
+                    // is picked up and says what it is. The local drop and the
+                    // pickup that follow stay silent so it chimes once.
+                    let lower = name.to_lowercase();
+                    let echo = self
+                        .announced_at
+                        .get(&lower)
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                    if *announced {
+                        self.announced_at.insert(lower, Instant::now());
+                        self.announced_at.retain(|_, t| t.elapsed() < Duration::from_secs(120));
+                    }
+                    let sound = (!echo && self.alerts.contains(&rarity_key))
+                        .then(|| rarity_key.to_lowercase());
+                    let entry = DropEntry {
+                        ts_ms: now_ms(),
+                        sound,
+                        rarity: rarity_key,
+                        ground: *ground,
+                        mf: *mf,
+                        tier,
+                        item_type: *item_type,
+                        item_id: *item_id,
+                        weapon_type: *weapon_type,
+                        seed: *seed,
+                        name: name.clone(),
+                        announced: *announced,
+                        zone: self.satanic.as_ref().map(|s| s.zone.clone()),
+                    };
+                    if self.drops.len() >= JOURNAL_CAP {
+                        self.drops.pop_front();
+                    }
+                    self.drops.push_back(entry.clone());
+                    return Some(entry);
+                }
+            }
+            GameEvent::SatanicZone { zone, buffs, debuffs } => {
+                if self.satanic.as_ref().map(|s| &s.zone) != Some(zone) {
+                    self.sz_changed = Some(Instant::now());
+                }
+                self.satanic = Some(SatanicZone {
+                    zone: zone.clone(),
+                    buffs: buffs.clone(),
+                    debuffs: debuffs.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Gold totals only make sense once the season mode is known, and only
+    /// while it stays the same — a mode switch is a different purse.
+    fn apply_currency(&mut self, c: &crate::parser::Currency) {
+        self.last_currency = Some(c.clone());
+        // The client says what it banks the moment it banks it, and the server
+        // answers with the new balance. The deposit is counted straight away —
+        // it is the only earnings signal that survives a tracker restart — and
+        // then subtracted from the balance step so the same coins count once.
+        if c.delta > 0 {
+            self.gold_earned += c.delta;
+            self.banked += c.delta;
+            self.last_bank = Some(Instant::now());
+            self.activity += 1;
+        }
+        let Some(mode) = self.season_mode else { return };
+        let current = c.for_mode(mode);
+        if current == 0 {
+            return;
+        }
+        self.last_bank = Some(Instant::now());
+        if self.stale_bank {
+            // carried over from the last run: only the deposits seen since the
+            // tracker started are ours to claim
+            self.total_gold = current;
+            self.gold_mode = Some(mode);
+            self.stale_bank = false;
+            self.banked = 0;
+            return;
+        }
+        if self.total_gold != 0 && self.gold_mode == Some(mode) {
+            let diff = current - self.total_gold;
+            if diff > 0 {
+                let already = self.banked.min(diff);
+                self.banked -= already;
+                if diff > already {
+                    self.gold_earned += diff - already;
+                    self.activity += 1;
+                }
+            }
+        }
+        self.total_gold = current;
+        self.gold_mode = Some(mode);
+    }
+
+    /// Called once a sampling interval by the watcher thread.
+    pub fn sample(&mut self) {
+        self.revision += 1;
+        if self.series.len() >= SERIES_CAP {
+            return;
+        }
+        self.series.push(SeriesPoint {
+            t: self.start.elapsed().as_secs(),
+            gold: self.gold_earned,
+            xp: self.xp_earned,
+        });
+    }
+
+    /// Session summary for the history file; None when nothing happened since
+    /// the last take. The caller resets the stats afterwards.
+    pub fn take_session(&mut self) -> Option<SessionRecord> {
+        let secs = self.start.elapsed().as_secs();
+        // check the floor BEFORE consuming the marker, or a too-early call
+        // silently disqualifies the session that follows it
+        if self.activity == self.taken_activity || secs < 30 {
+            return None;
+        }
+        self.taken_activity = self.activity;
+        Some(SessionRecord {
+            start_ms: self.start_ms,
+            end_ms: now_ms(),
+            secs,
+            gold: self.gold_earned,
+            xp: self.xp_earned,
+            items: self.items.iter().map(|(k, v)| (k.to_string(), v.total)).collect(),
+            mf: self.items.values().map(|v| v.mf).sum(),
+        })
+    }
+
+    fn per_hour(&self, value: i64) -> i64 {
+        let secs = self.start.elapsed().as_secs();
+        if secs == 0 {
+            0
+        } else {
+            value * 3600 / secs as i64
+        }
+    }
+
+    pub fn snapshot(&self, status: String) -> Snapshot {
+        let items = self
+            .items
+            .iter()
+            .map(|(name, c)| {
+                (name.to_string(), ItemStats {
+                    total: c.total,
+                    mf: c.mf,
+                    per_hour: self.per_hour(c.total),
+                })
+            })
+            .collect();
+        Snapshot {
+            status,
+            session_secs: self.start.elapsed().as_secs(),
+            has_mail: self.has_mail,
+            gold: Line {
+                total: self.total_gold,
+                earned: self.gold_earned,
+                per_hour: self.per_hour(self.gold_earned),
+            },
+            xp: Line {
+                total: self.total_xp,
+                earned: self.xp_earned,
+                per_hour: self.per_hour(self.xp_earned),
+            },
+            kills: Line {
+                total: self.total_kills,
+                earned: self.kills_earned,
+                per_hour: self.per_hour(self.kills_earned),
+            },
+            save_age_secs: self.last_save.map(|t| t.elapsed().as_secs()),
+            bank_age_secs: self.last_bank.map(|t| t.elapsed().as_secs()),
+            resources: self.resources.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            notable: self
+                .notable_defs
+                .iter()
+                .map(|(label, _)| NotableCount {
+                    label: label.clone(),
+                    total: self.notable.get(label).copied().unwrap_or(0),
+                })
+                .collect(),
+            items,
+            satanic_zone: self.satanic.clone(),
+            character: self.character.clone(),
+        }
+    }
+
+    pub fn extra(&self) -> Extra {
+        Extra {
+            character: self.character.clone(),
+            series: self.series.clone(),
+            drops: self.drops.iter().rev().cloned().collect(),
+            sz_active_secs: self.sz_changed.map(|t| t.elapsed().as_secs()),
+        }
+    }
+}
+
+/// The rarity the packet claims, if it maps to a known one.
+pub fn rarity_from_packet(rarity: &Value) -> Option<String> {
+    // numbers arrive as floats ("d": 5.0) — normalise before matching
+    let key = match crate::parser::as_int(rarity) {
+        Some(n) => n.to_string(),
+        None => match rarity {
+            Value::String(s) => s.trim().to_string(),
+            _ => return None,
+        },
+    };
+    if let Some((_, name)) = RARITIES.iter().find(|(id, _)| *id == key) {
+        return Some(name.to_string());
+    }
+    if key.is_empty() || key.parse::<i64>().is_ok() {
+        return None;
+    }
+    let mut chars = key.chars();
+    let titled = match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => key,
+    };
+    RARITIES.iter().any(|(_, n)| *n == titled).then_some(titled)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn rarity_name(rarity: &Value) -> String {
+    rarity_from_packet(rarity).unwrap_or_else(|| "Unknown".into())
+}
+
+/// The currency the account plays with, as the packets name it.
+fn currency_mode(mode: &str) -> Option<&'static str> {
+    ["GSS", "GSH", "GNS", "GNH", "GBP"].iter().copied().find(|m| *m == mode)
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Carried {
+    pub gold: i64,
+    pub mode: Option<String>,
+    pub xp: i64,
+    pub kills: i64,
+}
+
+#[derive(Serialize)]
+pub struct Line {
+    pub total: i64,
+    pub earned: i64,
+    pub per_hour: i64,
+}
+
+#[derive(Serialize)]
+pub struct ItemStats {
+    pub total: i64,
+    pub mf: i64,
+    pub per_hour: i64,
+}
+
+#[derive(Serialize)]
+pub struct Snapshot {
+    pub status: String,
+    pub session_secs: u64,
+    /// how long ago the game last reported these — it only does so when it
+    /// saves the character or banks gold
+    pub save_age_secs: Option<u64>,
+    pub bank_age_secs: Option<u64>,
+    pub has_mail: bool,
+    pub gold: Line,
+    pub xp: Line,
+    pub kills: Line,
+    pub resources: HashMap<String, i64>,
+    pub notable: Vec<NotableCount>,
+    pub items: HashMap<String, ItemStats>,
+    pub satanic_zone: Option<SatanicZone>,
+    pub character: Option<CharacterInfo>,
+}
+
+#[derive(Serialize)]
+pub struct Extra {
+    pub character: Option<CharacterInfo>,
+    pub series: Vec<SeriesPoint>,
+    pub drops: Vec<DropEntry>,
+    pub sz_active_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{self, Currency, GameEvent};
+    use serde_json::json;
+
+    fn item(rarity: serde_json::Value, mf: bool) -> GameEvent {
+        named_item(rarity, mf, "", "")
+    }
+
+    fn named_item(rarity: serde_json::Value, mf: bool, name: &str, fingerprint: &str) -> GameEvent {
+        GameEvent::ItemAdded {
+            rarity,
+            mf,
+            tier: 3,
+            item_type: 0,
+            item_id: 0,
+            weapon_type: 0,
+            seed: 0,
+            name: name.into(),
+            announced: false,
+            amount: 1,
+            fingerprint: fingerprint.into(),
+            hash: String::new(),
+            ground: false,
+        }
+    }
+
+    fn tiered_satanic(tier: i64, fingerprint: &str) -> GameEvent {
+        match named_item(json!(6), false, "", fingerprint) {
+            GameEvent::ItemAdded { rarity, mf, item_type, item_id, weapon_type, seed, name, announced, amount, fingerprint, ground, .. } => {
+                GameEvent::ItemAdded {
+                    rarity, mf, tier, item_type, item_id, weapon_type, seed, name, announced, amount,
+                    fingerprint, hash: String::new(), ground,
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn notable_item(name: &str, item_type: i64, amount: i64) -> GameEvent {
+        GameEvent::ItemAdded {
+            rarity: json!(1),
+            mf: false,
+            tier: 0,
+            item_type,
+            item_id: 0,
+            weapon_type: 0,
+            seed: 0,
+            name: name.into(),
+            announced: false,
+            amount,
+            fingerprint: format!("fp-{name}"),
+            hash: String::new(),
+            ground: false,
+        }
+    }
+
+    fn ground_item(rarity: serde_json::Value, name: &str, seed: i64) -> GameEvent {
+        GameEvent::ItemAdded {
+            rarity,
+            mf: false,
+            tier: 0,
+            item_type: 1,
+            item_id: 7,
+            weapon_type: 0,
+            seed,
+            name: name.into(),
+            announced: false,
+            amount: 1,
+            fingerprint: String::new(),
+            hash: String::new(),
+            ground: true,
+        }
+    }
+
+    fn account(season: i64, hardcore: i64, blood_pact: i64) -> GameEvent {
+        account_xp(season, hardcore, blood_pact, 0)
+    }
+
+    fn account_xp(season: i64, hardcore: i64, blood_pact: i64, experience: i64) -> GameEvent {
+        GameEvent::Account {
+            experience,
+            has_experience: experience > 0,
+            season,
+            hardcore,
+            blood_pact,
+            name: "Test".into(),
+            level: 10,
+            herolevel: 20,
+            difficulty: 2,
+            kills: 0,
+        }
+    }
+
+    #[test]
+    fn items_count_by_rarity_id_and_name() {
+        let mut s = GameStats::default();
+        s.set_prefer_ground(false);
+        s.apply(&item(json!(6), true));
+        s.apply(&item(json!("Satanic"), false));
+        s.apply(&item(json!("satanic"), false));
+        s.apply(&item(json!(999), false));
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.items["Satanic"].total, 3);
+        assert_eq!(snap.items["Satanic"].mf, 1);
+        assert_eq!(s.extra().drops.len(), 3);
+    }
+
+    #[test]
+    fn float_rarities_are_recognised() {
+        // the protocol writes whole numbers as floats
+        assert_eq!(rarity_from_packet(&json!(6.0)).as_deref(), Some("Satanic"));
+        assert_eq!(rarity_from_packet(&json!("9.0")).as_deref(), Some("Heroic"));
+    }
+
+    #[test]
+    fn filter_silences_alerts_without_touching_counters() {
+        let mut s = GameStats::default();
+        s.set_prefer_ground(false);
+        s.set_filter(vec!["Satanic".into()], 4);
+        // right rarity, tier below the floor
+        assert!(s.apply(&tiered_satanic(2, "8-1-1")).is_none(), "low tier must not alert");
+        // right rarity and tier
+        assert!(s.apply(&tiered_satanic(7, "8-2-1")).is_some());
+        // filtered-out rarity
+        assert!(s.apply(&named_item(json!(9), false, "", "8-3-1")).is_none());
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.items["Satanic"].total, 2, "counters ignore the filter");
+        assert_eq!(snap.items["Heroic"].total, 1);
+    }
+
+    #[test]
+    fn notable_drops_are_counted_by_name() {
+        let mut s = GameStats::default();
+        s.apply(&notable_item("Angelic Key", 12, 2));
+        s.apply(&notable_item("Jol", 15, 1));
+        s.apply(&notable_item("Zed", 15, 1));
+        s.apply(&notable_item("Ol", 15, 1));
+        let snap = s.snapshot(String::new());
+        let by = |label: &str| snap.notable.iter().find(|n| n.label == label).unwrap().total;
+        assert_eq!(by("Angelic Key"), 2);
+        assert_eq!(by("SS runes"), 1, "Jol is one of the four level-100 runes");
+        assert_eq!(by("S runes"), 1, "Zed is graded S");
+    }
+
+    #[test]
+    fn audit_short_session_does_not_swallow_the_next_record() {
+        let mut s = GameStats::default();
+        s.set_prefer_ground(false);
+        s.apply(&item(json!(6), false));
+        // a check before the 30s floor must not consume the activity marker
+        assert!(s.take_session().is_none());
+        s.start = Instant::now() - std::time::Duration::from_secs(120);
+        assert!(s.take_session().is_some(), "activity was consumed by the early check");
+    }
+
+    #[test]
+    fn identity_packets_do_not_override_the_real_season_mode() {
+        let mut s = GameStats::default();
+        s.apply(&account_xp(CURRENT_SEASON, 0, 0, 5_000)); // full packet: GSS
+        // a later login-identity packet claims season 0 with no experience
+        s.apply(&account(0, 0, 0));
+        assert_eq!(s.season_mode, Some("GSS"));
+        assert_eq!(s.character.as_ref().unwrap().level, 10);
+    }
+
+    /// The two packets exactly as the game sent them, in both possible orders.
+    fn account_packet(name: &str, kills: i64, experience: i64) -> GameEvent {
+        GameEvent::Account {
+            experience,
+            has_experience: true,
+            season: CURRENT_SEASON,
+            hardcore: 0,
+            blood_pact: 0,
+            name: name.into(),
+            level: 100,
+            herolevel: 112,
+            difficulty: 2,
+            kills,
+        }
+    }
+
+    #[test]
+    fn a_deposit_counts_once_when_the_new_balance_follows_it() {
+        // real order from a capture: the client banks 2600, then the server
+        // reports the balance that already contains it
+        let mut s = GameStats::default();
+        s.apply(&account_packet("Parahryushka", 0, 84_833_801));
+        let feed = |s: &mut GameStats, packet: serde_json::Value| {
+            for e in parser::events_from_messages(&[packet]) {
+                s.apply(&e);
+            }
+        };
+        feed(&mut s, json!({"currencyData": {"GSS": 720_239}}));
+        feed(&mut s, json!({"amount_gold": "2600"}));
+        feed(&mut s, json!({"currencyData": {"GSS": 722_839}}));
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.gold.earned, 2600, "the deposit counts, the balance does not repeat it");
+        assert_eq!(snap.gold.total, 722_839);
+        // gold that appears without a deposit (mail, selling) still counts
+        feed(&mut s, json!({"currencyData": {"GSS": 723_000}}));
+        assert_eq!(s.snapshot(String::new()).gold.earned, 2761);
+    }
+
+    #[test]
+    fn a_deposit_before_the_first_balance_still_counts() {
+        // a restart mid-session: the carried balance only re-anchors, but the
+        // gold banked while the tracker was up is ours
+        let mut s = GameStats::default();
+        s.restore(&Carried { gold: 717_188, mode: Some("GSS".into()), xp: 0, kills: 0 });
+        s.apply(&account_packet("Parahryushka", 0, 84_833_801));
+        for e in parser::events_from_messages(&[json!({"amount_gold": "2600"})]) {
+            s.apply(&e);
+        }
+        for e in parser::events_from_messages(&[json!({"currencyData": {"GSS": 722_839}})]) {
+            s.apply(&e);
+        }
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.gold.earned, 2600);
+        assert_eq!(snap.gold.total, 722_839);
+    }
+
+    #[test]
+    fn totals_carried_from_the_last_run_do_not_count_as_earned() {
+        let mut s = GameStats::default();
+        s.restore(&Carried { gold: 700_000, mode: Some("GSS".into()), xp: 90_000_000, kills: 912_000 });
+        // whatever the game reports first is the new baseline, not a windfall
+        s.apply(&account_packet("Parahryushka", 913_000, 91_000_000));
+        for e in parser::events_from_messages(&[json!({"currencyData": {"GSS": 715_517}})]) {
+            s.apply(&e);
+        }
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.gold.total, 715_517);
+        assert_eq!(snap.gold.earned, 0, "a restart must not invent earnings");
+        assert_eq!(snap.xp.earned, 0);
+        assert_eq!(snap.kills.earned, 0);
+        // and from there it counts normally again
+        s.apply(&account_packet("Parahryushka", 913_100, 91_500_000));
+        for e in parser::events_from_messages(&[json!({"currencyData": {"GSS": 716_000}})]) {
+            s.apply(&e);
+        }
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.kills.earned, 100);
+        assert_eq!(snap.xp.earned, 500_000);
+        assert_eq!(snap.gold.earned, 483);
+    }
+
+    #[test]
+    fn a_rune_counts_under_either_spelling() {
+        let mut s = GameStats::default();
+        s.apply(&notable_item("Ber", 15, 1));
+        s.apply(&notable_item("Jah Rune", 15, 1));
+        let snap = s.snapshot(String::new());
+        let group = snap.notable.iter().find(|n| n.label == "S runes").expect("group exists");
+        assert_eq!(group.total, 2, "both spellings land in the same group");
+    }
+
+    #[test]
+    fn a_named_drop_is_graded_by_the_item_table() {
+        // the packet that announces a named drop carries no tier, but the item
+        // itself always has one — SS for the AK-47
+        let mut s = GameStats::default();
+        s.set_prefer_ground(true);
+        s.set_filter(vec!["Satanic".into(), "Heroic".into()], 6);
+        let drop = |name: &str, hash: &str| GameEvent::ItemAdded {
+            rarity: json!(2),
+            mf: false,
+            tier: 0,
+            item_type: 3,
+            item_id: 15,
+            weapon_type: 14,
+            seed: 1,
+            name: name.into(),
+            announced: false,
+            amount: 1,
+            fingerprint: String::new(),
+            hash: hash.into(),
+            ground: true,
+        };
+        let ss = s.apply(&drop("AK-47", "a")).expect("an SS drop passes an SS filter");
+        assert_eq!(ss.tier, 6);
+        // a Satanic helm the table grades C — announced rarity, wrong grade
+        assert!(s.apply(&drop("Sky Crusader Helm", "b")).is_none(), "tier C is below SS");
+        // and an item the table does not know cannot prove SS either
+        assert!(s.apply(&drop("Mystery Blade", "c")).is_none(), "an ungraded item stays quiet");
+    }
+
+    #[test]
+    fn the_servers_announcement_chimes_and_the_pickup_stays_quiet() {
+        // "SERVER: Parahryushka Just found [Doctor's Potion]" — the game says
+        // it the moment the item lands, before anything else knows the tier
+        let mut s = GameStats::default();
+        s.set_filter(vec!["Set".into()], 5);
+        let announced = s
+            .apply(&GameEvent::ItemAdded {
+                rarity: Value::Null,
+                mf: false,
+                tier: 0,
+                item_type: 0,
+                item_id: 0,
+                weapon_type: 0,
+                seed: 0,
+                name: "Doctor's Potion".into(),
+                announced: true,
+                amount: 1,
+                fingerprint: String::new(),
+                hash: String::new(),
+                ground: false,
+            })
+            .expect("an announced find is always shown");
+        assert_eq!(announced.rarity, "Set");
+        assert_eq!(announced.sound.as_deref(), Some("set"));
+        // walking over it must not chime a second time
+        let picked = s.apply(&GameEvent::ItemAdded {
+            rarity: json!(4),
+            mf: false,
+            tier: 6,
+            item_type: 13,
+            item_id: 86,
+            weapon_type: 0,
+            seed: 1,
+            name: "Doctor's Potion".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "13-1-1".into(),
+            hash: String::new(),
+            ground: false,
+        });
+        assert!(picked.is_none_or(|d| d.sound.is_none()), "one item, one chime");
+    }
+
+    #[test]
+    fn the_tier_filter_belongs_to_pickup_alerts() {
+        // the tier is per roll, not per item, and the drop packet never carries
+        // it — so it can only narrow alerts that fire when an item is picked up
+        let ak = |tier: i64, ground: bool, fp: &str| GameEvent::ItemAdded {
+            rarity: json!(2),
+            mf: true,
+            tier,
+            item_type: 3,
+            item_id: 15,
+            weapon_type: 14,
+            seed: 924_824_705,
+            name: "AK-47".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: fp.into(),
+            hash: String::new(),
+            ground,
+        };
+
+        // alerting on the drop: rarity decides, the tier is unknown and ignored
+        let mut on_drop = GameStats::default();
+        on_drop.set_prefer_ground(true);
+        on_drop.set_filter(vec!["Heroic".into()], 6);
+        let entry = on_drop.apply(&ak(0, true, "")).expect("the drop is announced by rarity");
+        assert_eq!(entry.sound.as_deref(), Some("heroic"));
+
+        // alerting on the pickup: the tier is known and does its job
+        let mut on_pickup = GameStats::default();
+        on_pickup.set_prefer_ground(false);
+        on_pickup.set_filter(vec!["Heroic".into()], 6);
+        assert!(on_pickup.apply(&ak(3, false, "3-1-1")).is_none(), "tier B is below SS");
+        assert!(on_pickup.apply(&ak(6, false, "3-1-2")).is_some(), "tier SS passes");
+    }
+
+    #[test]
+    fn without_a_minimum_tier_the_drop_itself_is_announced() {
+        // real capture of an SS weapon hitting the ground: rarity comes from
+        // the name, and the packet carries no tier at all
+        let mut s = GameStats::default();
+        s.set_filter(vec!["Heroic".into()], 0);
+        let entry = s.apply(&GameEvent::ItemAdded {
+            rarity: json!(2),
+            mf: true,
+            tier: 0,
+            item_type: 3,
+            item_id: 15,
+            weapon_type: 14,
+            seed: 924_824_705,
+            name: "AK-47".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: String::new(),
+            hash: String::new(),
+            ground: true,
+        });
+        let entry = entry.expect("an SS drop must be announced");
+        // the packet claims Superior; the name is what decides
+        assert_eq!(entry.rarity, "Heroic");
+        assert!(entry.ground);
+    }
+
+    #[test]
+    fn a_rolled_back_kill_total_keeps_the_counter_moving() {
+        // a real capture: saves 76..80 of one character, where the game itself
+        // dropped the total by 3637 after an instance restart and climbed again
+        let saves = [909_625, 909_625, 905_988, 906_175, 906_286];
+        let mut s = GameStats::default();
+        for kills in saves {
+            s.apply(&account_packet("Parahryushka", kills, 75_807_189));
+        }
+        let snap = s.snapshot(String::new());
+        // the rollback only re-anchors; the 298 kills made after it still count
+        assert_eq!(snap.kills.earned, 906_286 - 905_988);
+        assert_eq!(snap.kills.total, 906_286);
+    }
+
+    #[test]
+    fn two_currency_packets_make_earned_gold() {
+        // the game reports the bank total, in either spelling, only when it
+        // changes — the first one calibrates, the second one earns
+        let mut s = GameStats::default();
+        s.apply(&account_packet("Parahryushka", 0, 75_807_189));
+        for total in [693_835, 694_452] {
+            let packet = json!({
+                "currencyData": {"GBP": 1706231, "GNH": 0, "GNS": 78101, "GSH": 0,
+                                 "GSS": total, "account_id": 49646},
+                "message": "Success!", "status": "1"
+            });
+            for e in parser::events_from_messages(&[packet]) {
+                s.apply(&e);
+            }
+        }
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.gold.total, 694_452);
+        assert_eq!(snap.gold.earned, 617);
+    }
+
+    #[test]
+    fn real_login_packets_yield_the_bank_total() {
+        let currency = json!({"currency_data": {"GBP": 1706231, "GNH": 0, "GNS": 78101, "GSH": 0, "GSS": 687514}});
+        let account = json!({
+            "name": "Parahryushka", "class": 3, "level": 100, "herolevel": 112,
+            "difficulty": 2, "season": CURRENT_SEASON, "hardcore": 0, "blood_pact": 0,
+            "experience": 63419870, "statisticTotalMonsterKills": 4210
+        });
+        for order in [[&currency, &account], [&account, &currency]] {
+            let mut s = GameStats::default();
+            for payload in order {
+                for e in crate::parser::events_from_messages(std::slice::from_ref(payload)) {
+                    s.apply(&e);
+                }
+            }
+            let snap = s.snapshot(String::new());
+            assert_eq!(snap.gold.total, 687_514, "gold total lost");
+            assert_eq!(snap.xp.total, 63_419_870);
+            assert_eq!(snap.kills.total, 4210);
+        }
+    }
+
+    #[test]
+    fn gold_replays_the_currency_that_preceded_the_account() {
+        let mut s = GameStats::default();
+        let gold = |g| GameEvent::Gold(Currency { gss: g, ..Default::default() });
+        // currency arrives before the season mode is known
+        s.apply(&gold(100));
+        assert_eq!(s.snapshot(String::new()).gold.total, 0);
+
+        s.apply(&account(CURRENT_SEASON, 0, 0));
+        assert_eq!(s.snapshot(String::new()).gold.total, 100);
+        s.apply(&gold(150));
+        s.apply(&gold(120));
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.gold.total, 120);
+        assert_eq!(snap.gold.earned, 50);
+    }
+
+    #[test]
+    fn guild_xp_before_the_first_account_total_does_not_inflate() {
+        let mut s = GameStats::default();
+        s.apply(&GameEvent::XpGain(15)); // 100 character xp guessed
+        s.apply(&account_xp(CURRENT_SEASON, 0, 0, 50_000_000));
+        assert_eq!(s.snapshot(String::new()).xp.earned, 100);
+        s.apply(&account_xp(CURRENT_SEASON, 0, 0, 50_000_500));
+        assert_eq!(s.snapshot(String::new()).xp.earned, 600);
+    }
+
+    #[test]
+    fn a_drop_and_its_pickup_are_one_item() {
+        // the server rolls the item (tier included, hash "abc"), then the same
+        // hash turns up in the bag with no tier of its own
+        let mut s = GameStats::default();
+        s.set_prefer_ground(true);
+        let sighting = |ground: bool, tier: i64| GameEvent::ItemAdded {
+            rarity: json!(6),
+            mf: false,
+            tier,
+            item_type: 8,
+            item_id: 1,
+            weapon_type: 0,
+            seed: 123,
+            name: "Azazel's Despair".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "8-1-1".into(),
+            hash: "abc".into(),
+            ground,
+        };
+        let dropped = s.apply(&sighting(true, 5)).expect("the roll is announced");
+        assert_eq!(dropped.tier, 5);
+        assert!(s.apply(&sighting(true, 5)).is_none(), "a world sync repeats the roll");
+        assert!(s.apply(&sighting(false, 0)).is_none(), "no second alert for the pickup");
+        assert_eq!(s.snapshot(String::new()).items["Satanic"].total, 1, "counted once");
+    }
+
+    #[test]
+    fn the_pickup_inherits_the_tier_the_roll_reported() {
+        let mut s = GameStats::default();
+        s.set_prefer_ground(false);
+        s.set_filter(vec!["Satanic".into()], 5);
+        let sighting = |ground: bool, tier: i64| GameEvent::ItemAdded {
+            rarity: json!(6),
+            mf: false,
+            tier,
+            item_type: 8,
+            item_id: 1,
+            weapon_type: 0,
+            seed: 7,
+            name: "Azazel's Despair".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "8-1-2".into(),
+            hash: "def".into(),
+            ground,
+        };
+        assert!(s.apply(&sighting(true, 6)).is_none(), "alerts are set to pickup time");
+        let picked = s.apply(&sighting(false, 0)).expect("the pickup alerts");
+        assert_eq!(picked.tier, 6, "the tier came from the roll");
+    }
+
+    #[test]
+    fn pickup_alerts_when_ground_alerts_are_off() {
+        let mut s = GameStats::default();
+        s.set_prefer_ground(false);
+        assert!(s.apply(&ground_item(json!(6), "Azazel's Despair", 55)).is_none());
+        assert!(s.apply(&named_item(json!(6), false, "Azazel's Despair", "8-2-1")).is_some());
+    }
+
+    #[test]
+    fn resynced_items_are_counted_once_and_named_rarity_wins() {
+        let mut s = GameStats::default();
+        // packet claims Rare, the wiki knows this name as Heroic
+        s.apply(&named_item(json!(3), false, "Azazel's Despair", "8-1-1"));
+        s.apply(&named_item(json!(3), false, "Azazel's Despair", "8-1-1"));
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.items["Heroic"].total, 1);
+        assert_eq!(snap.items["Rare"].total, 0);
+    }
+
+    #[test]
+    fn xp_gain_uses_original_factor() {
+        let mut s = GameStats::default();
+        s.apply(&GameEvent::XpGain(15));
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.xp.total, 100);
+        assert_eq!(snap.xp.earned, 100);
+    }
+
+    #[test]
+    fn season_mode_selection() {
+        let mode = |season, hardcore, blood_pact| {
+            let mut s = GameStats::default();
+            s.apply(&account(season, hardcore, blood_pact));
+            s.season_mode.unwrap()
+        };
+        assert_eq!(mode(CURRENT_SEASON, 0, 0), "GSS");
+        assert_eq!(mode(CURRENT_SEASON, 1, 0), "GSH");
+        assert_eq!(mode(0, 0, 1), "GBP");
+        assert_eq!(mode(3, 1, 0), "GNH");
+        assert_eq!(mode(3, 0, 0), "GNS");
+    }
+
+    #[test]
+    fn character_survives_reset_and_session_needs_activity() {
+        let mut s = GameStats::default();
+        assert!(s.take_session().is_none());
+        s.apply(&account(CURRENT_SEASON, 1, 0));
+        s.apply(&GameEvent::XpGain(15));
+        // too short a session is not recorded
+        assert!(s.take_session().is_none());
+        s.reset();
+        let snap = s.snapshot(String::new());
+        assert_eq!(snap.xp.earned, 0);
+        assert_eq!(snap.character.as_ref().unwrap().name, "Test");
+    }
+}

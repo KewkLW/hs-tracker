@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# creating the release and attaching the installer needs write access; new
+# repositories hand Actions a read-only token by default
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # package.json owns the version; fail the build if the tag disagrees
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          node scripts/set-version.mjs
+          pkg=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$pkg" = "$tag" ] || { echo "tag $tag != package.json $pkg"; exit 1; }
+
+      - run: npm run build
+
+      # the Npcap SDK import libraries are vendored, and wpcap.dll is
+      # delay-loaded, so no driver is needed on the runner
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hs-tracker-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: src-tauri/target/release/bundle/nsis/*.exe
+          body_path: CHANGELOG.md

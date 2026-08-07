@@ -1,0 +1,22 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.log
+
+# runtime data, written next to the executable — the leading slash matters,
+# or src/assets/sounds (the bundled alerts) would be ignored too
+settings.json
+sessions.json
+shopping.json
+positions.json
+carried.json
+debug-capture.jsonl
+/sounds/
+
+# datamined item tables: input for tools/gen_items.py, not ours to ship
+tools/data/
+tools/__pycache__/
+
+# local notes, not part of the published project
+docs/

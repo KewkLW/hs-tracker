@@ -1,0 +1,101 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "HS Tracker",
+  "version": "0.9.1",
+  "identifier": "com.hstracker.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5176",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "HS Tracker",
+        "width": 444,
+        "height": 199,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": false
+      },
+      {
+        "label": "settings",
+        "title": "HS Tracker Settings",
+        "width": 468,
+        "height": 680,
+        "resizable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "stats",
+        "title": "HS Tracker Statistics",
+        "width": 560,
+        "height": 600,
+        "resizable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "shop",
+        "title": "HS Tracker Shopping List",
+        "width": 300,
+        "height": 420,
+        "resizable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "ticker",
+        "title": "HS Tracker Ticker",
+        "width": 444,
+        "height": 170,
+        "resizable": false,
+        "visible": false,
+        "focus": false,
+        "focusable": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": { "enable": true, "scope": ["**/sounds/*"] }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "shortDescription": "Hero Siege session tracker overlay",
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "compression": "lzma"
+      }
+    }
+  }
+}
