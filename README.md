@@ -34,12 +34,6 @@ sends data anywhere — everything stays on your machine.
 - [Npcap](https://npcap.com) — the packet capture driver. Install it with the
   default options; the app tells you if it is missing.
 
-## Install
-
-Grab the installer from the [Releases](../../releases) page and run it. All
-data files (settings, sessions, carried totals, custom sounds) live next
-to the executable, so the app is fully portable.
-
 ## Usage
 
 The tray icon is the control centre: left click toggles the overlay, right
@@ -62,10 +56,6 @@ Every rarity has its own channel with an on/off switch, volume and a preview.
 executable, where it overrides the bundled one; **Default** removes it again.
 
 **Min tier** narrows alerts further: item grades
-(D..SS) come from the item tables, since the packet announcing a drop never
-states one. Counters always record everything — the filter only decides what
-makes a sound and a ticker line. Finds the server announces in chat always
-sound, whatever the filter says.
 
 ## How it works
 
@@ -74,26 +64,6 @@ process, learns which server addresses it is connected to, and captures those
 conversations with Npcap. Messages arrive as JSON, base64 blobs or query
 strings, sometimes several per packet and sometimes split across packets, so
 the reader reassembles them before parsing.
-
-A few details worth knowing if you plan to hack on it:
-
-- **Item identity is `(type, id, weaponType)`** — never the seed, which is just
-  the RNG roll. In the short inventory format the type is the last segment of
-  the fingerprint, `b` is the id inside that category, and `j` is the weapon
-  type for weapons.
-- **The rarity field in a packet is unreliable** (inventory syncs report Rare
-  for Satanic gear), so the item is named first and the rarity of that name
-  wins over the packet.
-- **Only named items are identified.** A named drop carries an id from the
-  unique item space; an ordinary base carries a small dense id that would
-  collide with it, so bases are never named or announced.
-- **Satanic Zones rotate on the half hour** (`:00` / `:30`), so the countdown
-  is computed locally.
-- Guild XP from chat is scaled back up by the game's 15% guild cut; account
-  packets then correct any drift.
-
-Turn on **Log parsed packets** in Settings to dump everything the parser sees
-into `debug-capture.jsonl` — the fastest way to investigate a wrong number.
 
 ## Building
 
@@ -130,8 +100,7 @@ reports the problem instead of crashing when Npcap is absent.
 
 ## Credits and licensing
 
-- The overlay is skinned with Hero Siege sprites, used with the developer's
-  permission. Hero Siege is © Panic Art Studios. This project is not affiliated
+- The overlay is skinned with Hero Siege sprites. Hero Siege is © Panic Art Studios. This project is not affiliated
   with or endorsed by them.
 - The protocol work builds on
   [hero-siege-stats](https://github.com/GuilhermeFaga/hero-siege-stats) and
@@ -139,9 +108,6 @@ reports the problem instead of crashing when Npcap is absent.
   the item identity, rarity and grade tables are generated from
   [hero-siege-helper](https://hero-siege-helper.vercel.app)'s datamined data
   and are not redistributed here.
-- The bundled alert sounds are the ones the author farms with; replace any of
-  them with **Browse…** in Settings, which copies your file into `sounds\` next
-  to the executable.
 
 The code is released under the [MIT license](LICENSE).
 
