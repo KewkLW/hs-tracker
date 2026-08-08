@@ -80,21 +80,36 @@
     ],
     "security": {
       "csp": null,
-      "assetProtocol": { "enable": true, "scope": ["**/sounds/*"] }
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**/sounds/*"
+        ]
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
     "shortDescription": "Hero Siege session tracker overlay",
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installMode": "currentUser",
         "displayLanguageSelector": false,
-        "languages": ["English"],
-        "compression": "lzma"
+        "languages": [
+          "English"
+        ],
+        "compression": "lzma",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installerHooks": "installer/hooks.nsh"
       }
     }
   }

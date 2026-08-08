@@ -43,11 +43,21 @@ entry copies it, ready to paste into the market search.
 
 ![Shopping list](screenshots/shopping-list.png)
 
-## Requirements
+## Install
 
-- Windows 10/11
-- [Npcap](https://npcap.com) — the packet capture driver. Install it with the
-  default options; the app tells you if it is missing.
+Grab the installer from the [Releases](../../releases) page and run it. It
+installs for the current user, so Windows never asks for administrator rights.
+
+![The installer](screenshots/installer.png)
+
+HS Tracker needs [Npcap](https://npcap.com), the packet capture driver, to read
+the game's traffic. The installer checks for it and, when it is missing, offers
+to download the official installer from npcap.com and run it — its defaults are
+fine. Npcap itself is not bundled: its free edition may not be redistributed
+inside another installer.
+
+Everything the app writes (settings, sessions, carried totals, custom sounds)
+lives next to the executable. Windows 10 or 11 is required.
 
 ## Usage
 
