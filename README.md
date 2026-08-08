@@ -9,6 +9,8 @@ kills, item drops by rarity, and the current Satanic Zone with its buffs and
 debuffs. It never touches the game process, never injects anything and never
 sends data anywhere — everything stays on your machine.
 
+![The overlay over a running game](screenshots/overlay.png)
+
 ## Features
 
 - **Compact overlay** — session timer, mail, gold, XP, item counters by rarity
@@ -27,6 +29,19 @@ sends data anywhere — everything stays on your machine.
 - **Shopping list** — a scratchpad where clicking an entry copies it to the
   clipboard, ready to paste into the market search.
 - Global hotkeys, autostart, per-section visibility, opacity and scale.
+
+## The windows
+
+| Statistics | Settings |
+| --- | --- |
+| ![Statistics](screenshots/statistics.png) | ![Settings](screenshots/settings.png) |
+
+Statistics keeps the per-rarity cards, notable drops, the gold/h and xp/h graph
+and the drop timeline; Settings holds the alerts, the overlay sections and the
+sound for each rarity. The shopping list is a scratchpad where clicking an
+entry copies it, ready to paste into the market search.
+
+![Shopping list](screenshots/shopping-list.png)
 
 ## Requirements
 
