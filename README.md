@@ -7,6 +7,34 @@
   <br>in the game's own skin.
 </p>
 
+## What this fork changes — and why
+
+This fork starts from upstream HS Tracker 1.0.1 and adds the tools we wanted for
+Season 10 farming and future trade research. The changes are grouped here so it
+is clear what differs from [Parazeya/hs-tracker](https://github.com/Parazeya/hs-tracker)
+and why each addition exists.
+
+| Change | Why we added it |
+| --- | --- |
+| **Selectable number formats** — Standard `K / M / B`, Hero Siege `k / kk / kkk`, or full comma-separated values. One reactive formatter now drives the overlay, dashboard, saved runs, graphs, and copied run cards. | Different parts of the tracker used different abbreviations, and Hero Siege's `kk` notation is useful only when the player actually wants it. The setting makes every view consistent and persists across launches. |
+| **Live hero-level forecast** — current HLv progress plus cumulative XP and ETA for the next ten levels. | XP/hour alone does not answer the practical question: “How long until my target hero level?” The forecast converts the current farming rate into that answer. |
+| **Saved level splits and historical forecasts** — active playtime for each observed character/hero level, ending XP-in-level, and forecast rows calculated at that run's XP/hour. | We wanted to compare farming routes by real level time, not only by a session-wide average. Partial first levels are labeled `observed remainder` instead of pretending they were fully tracked. |
+| **Start new run** on the Runs page. | Starting a clean benchmark should not require restarting the game or tracker. The existing safe reset path files the current non-empty run first, then resets its counters and clock. |
+| **Startup monitor and view preferences** — remember the old position or center on a selected monitor, and open as the dashboard or compact overlay. | Multi-monitor users needed predictable placement. The fallback handles disconnected displays, and game detection no longer opens a second overlay beside an already visible dashboard. |
+| **Passive market-observer groundwork** — opt-in structural observations, exact endpoint scoping, sanitized routes, TLS-framing summaries, and flow-aware TCP reassembly. | Hero Siege exposes no public trade API. This gives us a controlled way to determine what the game already sends without sending requests, touching game memory, injecting code, replaying authenticated traffic, or attempting MITM. It is research groundwork, **not yet a price checker or market client**. |
+| **Observer privacy and storage limits** — raw Debug Log is suppressed in observer mode; credential values and packet payloads are never written; address/adapter identities use secret-keyed per-process tags; logs rotate at 16 MB and keep one older segment. | Protocol research should fail closed and should not create an unbounded file containing account or network metadata. These limits also make accidental log sharing less revealing. |
+| **Capture/parser correctness and regression coverage** — market query routes stay separate from secret fields, reassembly keys use the full flow tuple, port 443 is tested by TLS framing rather than assumed encrypted, and duplicate adapter sightings are controlled. | The research output is only useful if split, concurrent, or port-443 traffic is classified correctly and cannot leak values through an ambiguous route. |
+| **Documentation and tests** — this overview, detailed fork/observer notes, JavaScript XP tests, Rust privacy/rotation tests, and corrected package-lock identity/version. | The behavior, estimates, safety boundaries, and remaining limitations need to be reviewable and reproducible instead of living only in commit history. The current branch passes 4 JavaScript and 135 Rust tests, the production Vite build, and strict Rust Clippy. |
+
+Hero-level requirements are labeled as a **community curve estimate**: they
+interpolate published Season 9 anchors plus one observed Season 10 value at
+HLv 10, then extrapolate the final segment above HLv 149. Old saved runs remain
+compatible but cannot display data they never recorded.
+
+See [FORK_CHANGES.md](FORK_CHANGES.md) for the compatibility notes and complete
+feature explanation, and [MARKET_OBSERVER.md](MARKET_OBSERVER.md) for the
+observer's controlled experiment, privacy boundary, and stopping conditions.
+
 <p align="center">
   <a href="../../releases"><b>➡️ Download for Windows &amp; Linux ⬅️</b></a>
 </p>
