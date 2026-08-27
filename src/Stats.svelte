@@ -20,7 +20,8 @@
     typeLabel,
     zoneCode,
   } from './items.js';
-  import { fmt, difficulty, RARITIES, RARITY_CLASS } from './format.js';
+  import { fmt, difficulty, RARITIES, RARITY_CLASS } from './format.svelte.js';
+  import { formatEta, heroXpRequired, levelForecast } from './xp.js';
 
   let snap = $state(null);
   let extra = $state(null);
@@ -92,6 +93,22 @@
     parts.push(`Lv ${c.level}`, `HLv ${c.herolevel}`, difficulty(c.difficulty, c.hell_sub));
     if (c.hardcore) parts.push('HC');
     return parts.join(' · ');
+  });
+
+  let heroXp = $derived.by(() => {
+    if ((snap?.character?.level ?? 0) < 100) return null;
+    const level = snap?.character?.herolevel;
+    if (level == null) return null;
+    const required = heroXpRequired(level);
+    if (!required) return null;
+    const current = Math.max(0, snap?.xp?.total ?? 0);
+    return {
+      level,
+      current,
+      required,
+      percent: Math.min(100, (current / required) * 100),
+      rows: levelForecast(level, current, snap?.xp?.per_hour, 10),
+    };
   });
 
   // gold, xp and kills only travel when the game saves the character or banks
@@ -616,6 +633,44 @@
       {/if}
     </div>
 
+        <div class="box level-forecast" style:border-image-source="url({art('chip_dark')})">
+          <div class="box-head">
+            <span class="accent">Level forecast</span>
+            <span class="right">at {fmt(snap?.xp?.per_hour)}/h · community curve estimate</span>
+          </div>
+          {#if heroXp}
+            <div class="level-now">
+              <div class="level-summary">
+                <span>HLv {heroXp.level} → {heroXp.level + 1}</span>
+                <b class="c-xp">{fmt(heroXp.current)} / {fmt(heroXp.required)}</b>
+                <span class="right">{heroXp.percent.toFixed(1)}%</span>
+              </div>
+              <div class="level-track" title="Estimated progress through the current hero level">
+                <span style:width={`${heroXp.percent}%`}></span>
+              </div>
+            </div>
+            <div class="forecast-head">
+              <span>target</span><span>XP from now</span><span>ETA</span>
+            </div>
+            <div class="forecast-rows">
+              {#each heroXp.rows as row, i}
+                <div class="forecast-row" class:first={i === 0}>
+                  <span>HLv {row.level}</span>
+                  <span>{fmt(row.cumulativeXp)}</span>
+                  <b>{formatEta(row.etaSeconds)}</b>
+                </div>
+              {/each}
+            </div>
+            {#if !snap?.xp?.per_hour}
+              <div class="forecast-note">ETA appears after the session has earned XP.</div>
+            {/if}
+          {:else if snap?.character && snap.character.level < 100}
+            <div class="dim empty">hero-level forecasts begin at character level 100</div>
+          {:else}
+            <div class="dim empty">waiting for character and hero-level data</div>
+          {/if}
+        </div>
+
         <div class="box" style:border-image-source="url({art('chip_dark')})">
           <div class="box-head"><span class="accent">Session rates</span></div>
           <canvas bind:this={canvas}></canvas>
@@ -1024,4 +1079,49 @@
   .c-gold { color: var(--gold-2); }
   .c-xp { color: #a06ae0; }
   .buffdesc.more { opacity: 0.75; font-style: italic; }
+
+  .level-now { padding: 2px 2px 5px; }
+  .level-summary {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .level-summary b { font-size: 13px; }
+  .level-track {
+    height: 5px;
+    margin-top: 4px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid var(--ground-10);
+  }
+  .level-track span {
+    display: block;
+    height: 100%;
+    min-width: 1px;
+    background: #8d55bd;
+  }
+  .forecast-head,
+  .forecast-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 72px;
+    gap: 8px;
+    align-items: baseline;
+    padding: 2px 4px;
+  }
+  .forecast-head {
+    color: var(--edge-2b);
+    font-size: 9px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+  }
+  .forecast-head span:nth-child(n + 2),
+  .forecast-row span:nth-child(2),
+  .forecast-row b { text-align: right; }
+  .forecast-rows { display: flex; flex-direction: column; gap: 1px; }
+  .forecast-row { background: rgba(0, 0, 0, 0.12); color: var(--bone-6); }
+  .forecast-row:nth-child(even) { background: rgba(0, 0, 0, 0.22); }
+  .forecast-row.first { color: var(--bone-11); }
+  .forecast-row.first b { color: #b989df; }
+  .forecast-note { color: var(--edge-8); font-size: 10px; padding: 5px 2px 0; }
 </style>

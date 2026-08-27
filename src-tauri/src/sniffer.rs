@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -32,7 +32,13 @@ pub enum Status {
     NoAccess,
     NoInterface,
     WaitingForGame,
-    Capturing { iface: String, hosts: usize, dropped: u32, packets: u32, deaf: Deaf },
+    Capturing {
+        iface: String,
+        hosts: usize,
+        dropped: u32,
+        packets: u32,
+        deaf: Deaf,
+    },
 }
 
 /// Whether the capture has gone the whole of `DEAF_AFTER` without decoding a
@@ -190,8 +196,7 @@ fn npcap_dir() -> PathBuf {
 /// worth reporting before anything else is attempted.
 #[cfg(windows)]
 pub fn capture_available() -> bool {
-    npcap_dir().join("wpcap.dll").exists()
-        || npcap_dir().parent().is_some_and(|s| s.join("wpcap.dll").exists())
+    npcap_dir().join("wpcap.dll").exists() || npcap_dir().parent().is_some_and(|s| s.join("wpcap.dll").exists())
 }
 
 /// Elsewhere libpcap is a package dependency and listing devices needs no
@@ -216,10 +221,7 @@ pub fn capture_available() -> bool {
             crate::log::once(
                 "capture-probe",
                 "warn",
-                format!(
-                    "cannot open {name} for capture: {e}{}",
-                    if refused { " - the binary needs cap_net_raw" } else { "" }
-                ),
+                format!("cannot open {name} for capture: {e}{}", if refused { " - the binary needs cap_net_raw" } else { "" }),
             );
             !refused
         }
@@ -243,14 +245,9 @@ fn game_pids(sys: &mut System) -> Vec<u32> {
     // Only names are wanted here. The default refresh also reads memory, io and
     // the executable path of every process on the box, three times a second,
     // for the whole time the game is not running.
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
-    );
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet));
     let looks_like_it = |s: &str| {
-        let flat: String =
-            s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        let flat: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
         flat.starts_with("herosiege")
     };
     sys.processes()
@@ -261,14 +258,10 @@ fn game_pids(sys: &mut System) -> Vec<u32> {
             // executable path or the command line instead, and matching the
             // comm alone would find nothing at all.
             looks_like_it(&p.name().to_string_lossy())
-                || p.exe()
-                    .and_then(|e| e.file_name())
-                    .is_some_and(|f| looks_like_it(&f.to_string_lossy()))
-                || p.cmd().first().is_some_and(|a| {
-                    std::path::Path::new(a)
-                        .file_name()
-                        .is_some_and(|f| looks_like_it(&f.to_string_lossy()))
-                })
+                || p.exe().and_then(|e| e.file_name()).is_some_and(|f| looks_like_it(&f.to_string_lossy()))
+                || p.cmd()
+                    .first()
+                    .is_some_and(|a| std::path::Path::new(a).file_name().is_some_and(|f| looks_like_it(&f.to_string_lossy())))
         })
         .map(|(pid, _)| pid.as_u32())
         .collect()
@@ -299,7 +292,7 @@ fn unmap(ip: IpAddr) -> IpAddr {
 /// The near ends were collected too and are not any more: see `scope_for` for
 /// why naming this machine's own address in the filter did more harm than the
 /// narrowing was worth.
-fn game_endpoints(pids: &[u32]) -> BTreeSet<IpAddr> {
+fn game_sockets(pids: &[u32]) -> BTreeSet<(IpAddr, u16)> {
     let mut remote = BTreeSet::new();
     if pids.is_empty() {
         return remote;
@@ -315,11 +308,15 @@ fn game_endpoints(pids: &[u32]) -> BTreeSet<IpAddr> {
                 if far.is_unspecified() || far.is_loopback() {
                     continue;
                 }
-                remote.insert(far);
+                remote.insert((far, t.remote_port));
             }
         }
     }
     remote
+}
+
+fn endpoint_addresses(sockets: &BTreeSet<(IpAddr, u16)>) -> BTreeSet<IpAddr> {
+    sockets.iter().map(|(address, _)| *address).collect()
 }
 
 /// Every adapter worth listening on. A split-tunnel engine (WireSock and the
@@ -341,11 +338,7 @@ fn capture_devices() -> Vec<pcap::Device> {
     // the same traffic is inside the tunnel. So the app excluded the one device
     // that would have worked, before ever asking Npcap, and reported nine
     // packets in ninety seconds with the filter already wide open.
-    let kept: Vec<pcap::Device> = all
-        .iter()
-        .filter(|d| worth_capturing(&d.addresses) && is_a_network(&d.name))
-        .cloned()
-        .collect();
+    let kept: Vec<pcap::Device> = all.iter().filter(|d| worth_capturing(&d.addresses) && is_a_network(&d.name)).cloned().collect();
 
     // Which adapters exist, and which were passed over. Every report of nothing
     // being counted has turned on this list and none of them arrived with it.
@@ -354,10 +347,7 @@ fn capture_devices() -> Vec<pcap::Device> {
         "info",
         format!(
             "adapters: {}{}",
-            kept.iter()
-                .map(|d| d.desc.clone().unwrap_or_else(|| d.name.clone()))
-                .collect::<Vec<_>>()
-                .join(", "),
+            kept.iter().map(|d| d.desc.clone().unwrap_or_else(|| d.name.clone())).collect::<Vec<_>>().join(", "),
             {
                 let skipped: Vec<String> = all
                     .iter()
@@ -401,10 +391,7 @@ fn worth_capturing(addresses: &[pcap::Address]) -> bool {
 /// through is caught after the fact by `unusable_device`.
 fn is_a_network(name: &str) -> bool {
     const PSEUDO: [&str; 5] = ["any", "nflog", "nfqueue", "dbus-system", "dbus-session"];
-    !PSEUDO.contains(&name)
-        && !name.starts_with("bluetooth")
-        && !name.starts_with("usbmon")
-        && !name.starts_with("nfqueue:")
+    !PSEUDO.contains(&name) && !name.starts_with("bluetooth") && !name.starts_with("usbmon") && !name.starts_with("nfqueue:")
 }
 
 /// Whether a capture ended because the device is not one we can read, rather
@@ -507,8 +494,7 @@ fn unoffload(data: &[u8], ip_start: usize) -> Option<Vec<u8>> {
 /// a wide filter on a busy machine hands this thread every plaintext byte the
 /// machine sends.
 fn wide_capture() -> bool {
-    WIDE.load(Ordering::Relaxed)
-        || matches!(std::env::var("HS_WIDE_CAPTURE").as_deref(), Ok("1") | Ok("true"))
+    WIDE.load(Ordering::Relaxed) || matches!(std::env::var("HS_WIDE_CAPTURE").as_deref(), Ok("1") | Ok("true"))
 }
 
 /// The far end, and only the far end.
@@ -577,6 +563,35 @@ fn scope_for(remote: &BTreeSet<IpAddr>) -> String {
     out.join(" or ")
 }
 
+/// Market research is privacy-sensitive, so it never inherits the tracker's
+/// broad `/24` or all-TCP fallback. These address/port pairs come directly from
+/// sockets owned by the Hero Siege PID. A new ephemeral local port still
+/// matches the already-attributed remote endpoint.
+fn market_scope_for(remote: &BTreeSet<(IpAddr, u16)>) -> String {
+    if remote.is_empty() {
+        return "port 0".into();
+    }
+    remote.iter().map(|(address, port)| format!("(host {address} and port {port})")).collect::<Vec<_>>().join(" or ")
+}
+
+fn resolve_market_endpoints(raw: &str) -> BTreeSet<(IpAddr, u16)> {
+    let mut endpoints = BTreeSet::new();
+    for value in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        if let Ok(addresses) = value.to_socket_addrs() {
+            endpoints.extend(addresses.map(|address| (address.ip(), address.port())));
+        }
+    }
+    endpoints
+}
+
+/// Optional endpoint(s) learned during the metadata phase. This closes the
+/// race where a short-lived Search socket opens and closes between process
+/// socket sweeps without broadening observer mode to all TCP.
+fn configured_market_endpoints() -> &'static BTreeSet<(IpAddr, u16)> {
+    static ENDPOINTS: OnceLock<BTreeSet<(IpAddr, u16)>> = OnceLock::new();
+    ENDPOINTS.get_or_init(|| std::env::var("HS_MARKET_ENDPOINTS").map(|value| resolve_market_endpoints(&value)).unwrap_or_default())
+}
+
 pub fn spawn(shared: &Shared, app: tauri::AppHandle) {
     let stats = shared.stats.clone();
     let status = shared.status.clone();
@@ -598,9 +613,7 @@ fn denied_open(e: &pcap::Error) -> bool {
         pcap::Error::ErrnoError(errno) => matches!(errno.0, 1 | 13),
         other => {
             let text = other.to_string().to_lowercase();
-            ["permission", "not permitted", "cap_net_raw", "denied", "root"]
-                .iter()
-                .any(|m| text.contains(m))
+            ["permission", "not permitted", "cap_net_raw", "denied", "root"].iter().any(|m| text.contains(m))
         }
     }
 }
@@ -693,11 +706,20 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         // inode-to-pid map — four calls in five were thrown away.
         if running && looked.elapsed() >= Duration::from_secs(5) {
             looked = std::time::Instant::now();
-            let remote = game_endpoints(&pids);
+            let sockets = game_sockets(&pids);
+            let remote = endpoint_addresses(&sockets);
             hosts = remote.len();
             wanted = capture_devices();
             let narrow = scope_for(&remote);
-            let next = if wide_capture() { "tcp".to_string() } else { narrow };
+            let next = if crate::market_observer_enabled() {
+                let mut observer_endpoints = sockets.clone();
+                observer_endpoints.extend(configured_market_endpoints().iter().copied());
+                market_scope_for(&observer_endpoints)
+            } else if wide_capture() {
+                "tcp".to_string()
+            } else {
+                narrow
+            };
             if next != scope {
                 crate::log::say("net", &format!("capture filter: {next}"));
                 scope = next;
@@ -714,9 +736,7 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         let productive = captures.values().any(|c| c.hits.load(Ordering::Relaxed) > 0);
         captures.retain(|name, c| {
             // give a new capture a while to prove itself, then judge it
-            let silent = productive
-                && c.started.elapsed() >= Duration::from_secs(45)
-                && c.hits.load(Ordering::Relaxed) == 0;
+            let silent = productive && c.started.elapsed() >= Duration::from_secs(45) && c.hits.load(Ordering::Relaxed) == 0;
             // A thread that ended by itself without a single message could not
             // open the adapter — the usual state of a Linux binary without
             // cap_net_raw. Re-opening it every second forever would be a busy
@@ -734,11 +754,7 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                 let rest = if opened { Duration::from_secs(10) } else { Duration::from_secs(300) };
                 barren.insert(name.clone(), (std::time::Instant::now(), rest));
             }
-            let keep = running
-                && !silent
-                && !c.handle.is_finished()
-                && c.scope == scope
-                && wanted.iter().any(|d| d.name == *name);
+            let keep = running && !silent && !c.handle.is_finished() && c.scope == scope && wanted.iter().any(|d| d.name == *name);
             if !keep {
                 c.stop.store(true, Ordering::Relaxed);
             }
@@ -769,28 +785,19 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                     // "no interface" is the wrong story when the adapter is
                     // there and the process simply may not open it — the usual
                     // state of a fresh Linux install without cap_net_raw.
-                    if let Err(e) =
-                        capture_loop(dev, scope, stop, stats, dropped, hits, packets, tls, opened, &app)
-                    {
+                    if let Err(e) = capture_loop(dev, scope, stop, stats, dropped, hits, packets, tls, opened, &app) {
                         // Something libpcap lists but cannot filter on. Said
                         // once, at a level nobody has to act on, and left alone
                         // from then on — the status line belongs to the
                         // adapters that can actually carry the game.
                         if unusable_device(&e) {
-                            crate::log::once(
-                                &format!("unusable:{name}"),
-                                "info",
-                                format!("{name} is not a device we can read: {e}"),
-                            );
+                            crate::log::once(&format!("unusable:{name}"), "info", format!("{name} is not a device we can read: {e}"));
                             return;
                         }
                         let refused = denied_open(&e);
                         // The README asks for this log when something is wrong;
                         // until now the whole module never wrote a line to it.
-                        crate::log::warn(format!(
-                            "capture on {name} ended: {e}{}",
-                            if refused { " - the binary needs cap_net_raw" } else { "" }
-                        ));
+                        crate::log::warn(format!("capture on {name} ended: {e}{}", if refused { " - the binary needs cap_net_raw" } else { "" }));
                         // Refused is not the same as absent. If the driver is
                         // there, the answer the user needs is about rights, not
                         // about installing anything.
@@ -828,10 +835,7 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         // finished yet" is also true of one spawned a moment ago and about to
         // die on a permission error, so the line went green on every spawn and
         // a machine without the right watched it alternate every five minutes.
-        let alive: Vec<&Capture> = captures
-            .values()
-            .filter(|c| c.opened.load(Ordering::Relaxed) && !c.handle.is_finished())
-            .collect();
+        let alive: Vec<&Capture> = captures.values().filter(|c| c.opened.load(Ordering::Relaxed) && !c.handle.is_finished()).collect();
         if !alive.is_empty() {
             let dropped = alive.iter().map(|c| c.dropped.load(Ordering::Relaxed)).sum();
             let mut ifaces: Vec<&str> = alive.iter().map(|c| c.iface.as_str()).collect();
@@ -913,10 +917,8 @@ fn capture_loop(
     opened: Arc<AtomicBool>,
     app: &tauri::AppHandle,
 ) -> Result<(), pcap::Error> {
-    let mut cap = pcap::Capture::from_device(dev)?
-        .immediate_mode(true)
-        .timeout(400)
-        .open()?;
+    let adapter = dev.name.clone();
+    let mut cap = pcap::Capture::from_device(dev)?.immediate_mode(true).timeout(400).open()?;
     cap.filter(&format!("tcp and len > 30 and ({scope})"), true)?;
     // past every way this can fail: only now is it a capture
     opened.store(true, Ordering::Relaxed);
@@ -927,15 +929,22 @@ fn capture_loop(
     let mut asm = Reassembler::default();
     let mut swept = std::time::Instant::now();
     let mut counted = std::time::Instant::now();
+    let market_observer = crate::market_observer_enabled();
+    let mut port_443_windows: HashMap<parser::Flow, crate::market::Port443Summary> = HashMap::new();
+    let mut port_443_swept = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
+        if market_observer && port_443_swept.elapsed() >= Duration::from_secs(1) {
+            crate::market_port_443_observation_log(&port_443_windows, &adapter);
+            port_443_windows.clear();
+            port_443_swept = std::time::Instant::now();
+        }
         if counted.elapsed() >= Duration::from_secs(15) {
             counted = std::time::Instant::now();
             if let Ok(st) = cap.stats() {
                 dropped.store(st.dropped + st.if_dropped, Ordering::Relaxed);
                 #[cfg(debug_assertions)]
-                println!("[capture] {} packets seen, {} dropped, {} dropped by the adapter",
-                    st.received, st.dropped, st.if_dropped);
+                println!("[capture] {} packets seen, {} dropped, {} dropped by the adapter", st.received, st.dropped, st.if_dropped);
             }
         }
         let packet = match cap.next_packet() {
@@ -953,16 +962,17 @@ fn capture_loop(
         };
         if packet.is_none() || swept.elapsed() >= Duration::from_millis(100) {
             swept = std::time::Instant::now();
-            for (src, flushed) in asm.drain_idle() {
-                handle_flush(&flushed, src, &stats, &hits, app);
+            for (flow, flushed) in asm.drain_idle() {
+                handle_flush(&flushed, flow, &stats, &hits, app, &adapter);
             }
         }
-        let Some((data, whole)) = packet else { continue };
+        let Some((data, whole)) = packet else {
+            continue;
+        };
         // A segmentation-offloading adapter hands us the whole buffer with a
         // length field describing one segment of it; `unoffload` puts the two
         // back in agreement, and returns nothing at all in the ordinary case.
-        let patched =
-            whole.then(|| ip_offset(data, framing).and_then(|at| unoffload(data, at))).flatten();
+        let patched = whole.then(|| ip_offset(data, framing).and_then(|at| unoffload(data, at))).flatten();
         let data: &[u8] = patched.as_deref().unwrap_or(data);
         let sliced = match framing {
             1 => SlicedPacket::from_ethernet(data), // DLT_EN10MB
@@ -981,7 +991,10 @@ fn capture_loop(
             Some(NetSlice::Ipv6(v6)) => IpAddr::V6(v6.header().source_addr()),
             _ => continue,
         };
-        let Some(TransportSlice::Tcp(tcp)) = &pkt.transport else { continue };
+        let Some(TransportSlice::Tcp(tcp)) = &pkt.transport else {
+            continue;
+        };
+        let flow = (src, tcp.source_port(), tcp.destination_port());
         // The filter is deliberately wide (everything this machine sends and
         // receives), so TLS is skipped here: an encrypted stream cannot yield
         // the plaintext the parser looks for, and reassembling it is pure cost.
@@ -993,15 +1006,28 @@ fn capture_loop(
         // payloads that never match, which the scan budget already bounds.
         if tcp.source_port() == 443 || tcp.destination_port() == 443 {
             tls.fetch_add(1, Ordering::Relaxed);
-            if !wide_capture() {
+            if market_observer {
+                let summary = port_443_windows.entry(flow).or_default();
+                summary.packet_count = summary.packet_count.saturating_add(1);
+                summary.payload_bytes = summary.payload_bytes.saturating_add(tcp.payload().len() as u64);
+                if crate::market::looks_like_tls_record(tcp.payload()) {
+                    summary.tls_like_packet_count = summary.tls_like_packet_count.saturating_add(1);
+                }
+            }
+            // Observer mode still feeds 443 through the bounded parser. A port
+            // number is not proof of encryption: route optimizers can relay the
+            // ordinary plaintext protocol there. Raw bytes are never logged.
+            if !wide_capture() && !market_observer {
                 continue;
             }
         }
 
-        let flow = (src, tcp.source_port(), tcp.destination_port());
         if let Some(flushed) = asm.push(flow, tcp.acknowledgment_number(), tcp.payload()) {
-            handle_flush(&flushed, src, &stats, &hits, app);
+            handle_flush(&flushed, flow, &stats, &hits, app, &adapter);
         }
+    }
+    if market_observer {
+        crate::market_port_443_observation_log(&port_443_windows, &adapter);
     }
     Ok(())
 }
@@ -1011,7 +1037,9 @@ fn capture_loop(
 /// would count double — so an identical message seen twice is dropped.
 fn fresh_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     static SEEN: Mutex<Option<Vec<(u64, std::time::Instant)>>> = Mutex::new(None);
-    let Ok(mut guard) = SEEN.lock() else { return messages };
+    let Ok(mut guard) = SEEN.lock() else {
+        return messages;
+    };
     let seen = guard.get_or_insert_with(Vec::new);
     seen.retain(|(_, at)| at.elapsed() < Duration::from_secs(10));
     messages
@@ -1030,18 +1058,14 @@ fn fresh_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn handle_flush(
-    flushed: &[u8],
-    src: IpAddr,
-    stats: &Arc<Mutex<GameStats>>,
-    hits: &Arc<AtomicU32>,
-    app: &tauri::AppHandle,
-) {
+fn handle_flush(flushed: &[u8], flow: parser::Flow, stats: &Arc<Mutex<GameStats>>, hits: &Arc<AtomicU32>, app: &tauri::AppHandle, adapter: &str) {
+    let src = flow.0;
     let messages = fresh_messages(parser::extract_messages(flushed));
     if messages.is_empty() {
         return;
     }
     hits.fetch_add(1, Ordering::Relaxed);
+    crate::market_observation_log(&messages, flow, adapter);
     crate::debug_log(&messages, src);
     let events = parser::events_from_messages(&messages);
     crate::dev_log(&events, src);
@@ -1141,6 +1165,28 @@ mod tests {
         assert_eq!(scope_for(&BTreeSet::new()), "tcp");
     }
 
+    #[test]
+    fn market_observer_scope_is_empty_until_the_game_names_an_exact_endpoint() {
+        assert_eq!(market_scope_for(&BTreeSet::new()), "port 0");
+        let endpoints = [("192.0.2.10".parse::<IpAddr>().unwrap(), 443), ("198.51.100.20".parse::<IpAddr>().unwrap(), 6600)]
+            .into_iter()
+            .collect();
+        let filter = market_scope_for(&endpoints);
+        assert!(filter.contains("host 192.0.2.10 and port 443"));
+        assert!(filter.contains("host 198.51.100.20 and port 6600"));
+        assert!(!filter.contains("/24"));
+    }
+
+    #[test]
+    fn configured_market_endpoints_are_explicit_and_bounded() {
+        let endpoints = resolve_market_endpoints("192.0.2.10:443,198.51.100.20:6600");
+        assert_eq!(endpoints.len(), 2);
+        let filter = market_scope_for(&endpoints);
+        assert!(filter.contains("host 192.0.2.10 and port 443"));
+        assert!(filter.contains("host 198.51.100.20 and port 6600"));
+        assert!(!filter.contains("tcp"));
+    }
+
     /// And once it does, the filter names the far end only.
     ///
     /// It used to name both — `(the servers' /24s) and (host <this machine>)`.
@@ -1152,17 +1198,10 @@ mod tests {
     /// When they differ the old filter matched nothing at all, silently.
     #[test]
     fn the_filter_names_the_far_end_and_leaves_this_machine_alone() {
-        let remote: BTreeSet<IpAddr> =
-            ["172.104.128.178".parse().unwrap(), "139.162.166.201".parse().unwrap()]
-                .into_iter()
-                .collect();
+        let remote: BTreeSet<IpAddr> = ["172.104.128.178".parse().unwrap(), "139.162.166.201".parse().unwrap()].into_iter().collect();
         let filter = scope_for(&remote);
 
-        assert_eq!(
-            filter,
-            "net 139.162.166.0/24 or net 172.104.128.0/24",
-            "the game's servers and their neighbours, and nothing else"
-        );
+        assert_eq!(filter, "net 139.162.166.0/24 or net 172.104.128.0/24", "the game's servers and their neighbours, and nothing else");
 
         // the concern that put the far side there in the first place
         assert!(!filter.contains("192.168.0.226"));
@@ -1171,14 +1210,10 @@ mod tests {
 
         // Two servers in one range are one clause, so a third joining it is
         // already covered without waiting for the endpoints to be re-read.
-        let pair: BTreeSet<IpAddr> =
-            ["172.104.128.178".parse().unwrap(), "172.104.128.9".parse().unwrap()]
-                .into_iter()
-                .collect();
+        let pair: BTreeSet<IpAddr> = ["172.104.128.178".parse().unwrap(), "172.104.128.9".parse().unwrap()].into_iter().collect();
         assert_eq!(scope_for(&pair), "net 172.104.128.0/24");
     }
 }
-
 
 #[cfg(test)]
 mod offload_tests {

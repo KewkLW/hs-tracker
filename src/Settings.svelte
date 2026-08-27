@@ -16,7 +16,11 @@
   $effect(() => remember('settings-advanced', advanced ? '1' : '0'));
 
   let session = $state(null);
+  let monitors = $state([]);
   let overlay = $derived(session?.overlay ?? false);
+  let selectedMonitorMissing = $derived(
+    !!settings?.launch_monitor && !monitors.some((monitor) => monitor.id === settings.launch_monitor),
+  );
   // The frameless look is only worth offering where it can be judged, and only
   // worth warning about where it costs something — see App.svelte.
   const smears = typeof document !== 'undefined' && document.documentElement.dataset.os === 'linux';
@@ -24,6 +28,9 @@
     invoke('session_info')
       .then((s) => (session = s))
       .catch(() => (session = { overlay: true, wayland: false, through_x11: false, can_switch: false }));
+    invoke('get_monitors')
+      .then((list) => (monitors = list ?? []))
+      .catch(() => (monitors = []));
   });
 
   let notice = $state('');
@@ -198,10 +205,53 @@
         </select>
       </div>
       <div class="line" data-tauri-drag-region>
+        <span class="name">Numbers</span>
+        <select
+          class="picker"
+          value={settings.number_display ?? 'standard'}
+          onchange={(e) => { settings.number_display = e.target.value; save(); }}
+          title="How large gold and experience values are abbreviated"
+        >
+          <option value="standard">Standard (K / M / B)</option>
+          <option value="hero-siege">Hero Siege (k / kk / kkk)</option>
+          <option value="full">Full numbers</option>
+        </select>
+      </div>
+      <div class="line" data-tauri-drag-region>
         <button class="check" onclick={() => { settings.autostart = !settings.autostart; save(); }} aria-label="autostart">
           <img src={settings.autostart ? art('check_on') : art('check_off')} alt="" />
         </button>
         <span class="opt">Start on login</span>
+      </div>
+      <div class="line" data-tauri-drag-region>
+        <span class="name">Launch on</span>
+        <select
+          class="picker"
+          value={settings.launch_monitor ?? ''}
+          onchange={(e) => { settings.launch_monitor = e.target.value; save(); }}
+        >
+          <option value="">Remember last position</option>
+          {#if selectedMonitorMissing}
+            <option value={settings.launch_monitor}>Disconnected monitor</option>
+          {/if}
+          {#each monitors as monitor}
+            <option value={monitor.id}>{monitor.label}{monitor.primary ? ' (primary)' : ''}</option>
+          {/each}
+        </select>
+      </div>
+      <div class="line" data-tauri-drag-region>
+        <span class="name">Open as</span>
+        <select
+          class="picker"
+          value={settings.launch_compact ? 'compact' : 'full'}
+          onchange={(e) => { settings.launch_compact = e.target.value === 'compact'; save(); }}
+        >
+          <option value="full">Full dashboard</option>
+          <option value="compact" disabled={!overlay}>Compact overlay</option>
+        </select>
+      </div>
+      <div class="hint launch-hint" data-tauri-drag-region>
+        Applied the next time HS Tracker starts. A selected monitor opens the chosen view centered there.
       </div>
       <div class="line" data-tauri-drag-region>
         <button class="check" onclick={() => { settings.discord = !settings.discord; save(); }} aria-label="discord">
@@ -597,6 +647,7 @@
     padding: 0 2px 6px 30px;
     max-width: 620px;
   }
+  .hint.launch-hint { padding-left: 116px; }
 
   .notice {
     font-size: 10px;

@@ -1,5 +1,6 @@
 mod items;
 mod log;
+mod market;
 mod parser;
 mod presence;
 mod sniffer;
@@ -23,17 +24,9 @@ const SOUND_KEYS: [&str; 7] = ["satanic", "set", "heroic", "angelic", "unholy", 
 /// A sound is either one of the built-in alerts or a list's own file,
 /// named `list-<id>`. Anything else must not reach the filesystem.
 fn sound_key(key: &str) -> bool {
-    SOUND_KEYS.contains(&key)
-        || (key.len() <= 40
-            && key.starts_with("list-")
-            && key[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    SOUND_KEYS.contains(&key) || (key.len() <= 40 && key.starts_with("list-") && key[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
-const SOUND_EXTS: [(&str, &str); 4] = [
-    ("mp3", "audio/mpeg"),
-    ("wav", "audio/wav"),
-    ("ogg", "audio/ogg"),
-    ("flac", "audio/flac"),
-];
+const SOUND_EXTS: [(&str, &str); 4] = [("mp3", "audio/mpeg"), ("wav", "audio/wav"), ("ogg", "audio/ogg"), ("flac", "audio/flac")];
 
 // The overlay's width never changes; its height is whatever its rows add up to,
 // and the web side measures that itself (see `fit_overlay`). The figures here
@@ -229,7 +222,13 @@ pub struct SoundList {
 
 impl Default for SoundList {
     fn default() -> Self {
-        Self { id: String::new(), name: String::new(), enabled: true, volume: 0.5, items: Vec::new() }
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            volume: 0.5,
+            items: Vec::new(),
+        }
     }
 }
 
@@ -302,6 +301,9 @@ pub struct Settings {
     /// does not quietly halve every per-hour figure
     /// which skin the windows wear: "default", or a season's own colours
     pub theme: String,
+    /// How large values are abbreviated: standard K/M/B, Hero Siege's
+    /// k/kk/kkk dialect, or full comma-separated numbers.
+    pub number_display: String,
     /// A window that plays the game's own loot pillar when something worth it
     /// drops. Off by default: it is a window over the game, and that is the
     /// player's screen to give away, not ours to take.
@@ -333,6 +335,11 @@ pub struct Settings {
     pub discord: bool,
     /// which face was up last: the overlay (true) or the dashboard
     pub compact: bool,
+    /// Which face a fresh process opens, independently of whichever face was
+    /// last used in the current session.
+    pub launch_compact: bool,
+    /// Stable monitor name, or empty to restore the last remembered position.
+    pub launch_monitor: String,
     /// Whether a locked overlay drops its frame and lets the numbers float over
     /// the game. It needs the window to clear itself between frames, which
     /// WebKitGTK on a transparent X11 window does not do — so it is off by
@@ -365,10 +372,7 @@ impl Default for Settings {
             zone_buffs: Vec::new(),
             alerts: stats::JOURNAL_RARITIES.iter().map(|r| r.to_string()).collect(),
             min_tier: 0,
-            notable: stats::default_notable()
-                .into_iter()
-                .map(|(label, names)| NotableGroup { label, names })
-                .collect(),
+            notable: stats::default_notable().into_iter().map(|(label, names)| NotableGroup { label, names }).collect(),
             filters: Vec::new(),
             filter: String::new(),
             use_filter: true,
@@ -383,6 +387,7 @@ impl Default for Settings {
             wide_capture: false,
             sound_on_ground: true,
             theme: "default".into(),
+            number_display: "standard".into(),
             // On out of the box. Off, with the narrowest band it has, it
             // announced nothing at all — which reads as a broken feature
             // rather than an unset one, and cost a bug report saying so.
@@ -390,10 +395,7 @@ impl Default for Settings {
             flourish_scale: 1.0,
             flourish_shade: 0.55,
             flourish_secs: 6.0,
-            flourish_rarities: ["Satanic", "Set", "Heroic", "Angelic", "Unholy"]
-                .iter()
-                .map(|r| r.to_string())
-                .collect(),
+            flourish_rarities: ["Satanic", "Set", "Heroic", "Angelic", "Unholy"].iter().map(|r| r.to_string()).collect(),
             // grade 1 is D, which this slider reads as "any"
             flourish_tier: 1,
             flourish_listed: false,
@@ -404,6 +406,8 @@ impl Default for Settings {
             flourish_always: false,
             discord: false,
             compact: false,
+            launch_compact: false,
+            launch_monitor: String::new(),
             ghost: ghost_default(),
             x11_backend: false,
             hidden: Vec::new(),
@@ -433,14 +437,12 @@ pub(crate) fn overlay_supported() -> bool {
 /// lands on Wayland. Only the first entry says what the toolkit will use.
 #[cfg(not(windows))]
 fn forced_x11() -> bool {
-    std::env::var("GDK_BACKEND")
-        .is_ok_and(|v| v.to_lowercase().split(',').next().is_some_and(|first| first.trim() == "x11"))
+    std::env::var("GDK_BACKEND").is_ok_and(|v| v.to_lowercase().split(',').next().is_some_and(|first| first.trim() == "x11"))
 }
 
 #[cfg(not(windows))]
 fn wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
 }
 
 /// XWayland's socket, which is what the X11 backend actually needs.
@@ -600,7 +602,9 @@ fn relaunch(x11: bool) -> Result<(), String> {
 /// replayed against the parser when counters look wrong.
 pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
     use std::io::Write;
-    if !DEBUG_LOG.load(Ordering::Relaxed) {
+    // Fail closed: sanitized market research and the credential-bearing raw
+    // debug log may never run together, even if Debug Log was persisted on.
+    if market_observer_enabled() || !DEBUG_LOG.load(Ordering::Relaxed) {
         return;
     }
     // The file stays open: with the wide capture this runs many times a second.
@@ -651,8 +655,32 @@ pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
     let _ = f.flush();
 }
 
-/// `npm start` builds: every parsed event goes to the terminal, and the
-/// overlay opens with devtools so the webview console is visible too.
+/// A deliberately narrower protocol log for market research. Unlike the raw
+/// debug capture this never writes packet bodies or field values that can
+/// authenticate the account. It is opt-in through an environment variable so
+/// ordinary tracker users do not create another runtime file.
+pub(crate) fn market_observation_log(messages: &[serde_json::Value], flow: parser::Flow, adapter: &str) {
+    if !market_observer_enabled() {
+        return;
+    }
+    let _ = market::append_observations(&data_dir().join("market-observations.jsonl"), messages, flow, adapter);
+}
+
+pub(crate) fn market_observer_enabled() -> bool {
+    std::env::var("HS_MARKET_OBSERVER")
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+pub(crate) fn market_port_443_observation_log(windows: &std::collections::HashMap<parser::Flow, market::Port443Summary>, adapter: &str) {
+    if !market_observer_enabled() {
+        return;
+    }
+    let _ = market::append_port_443_windows(&data_dir().join("market-observations.jsonl"), windows, adapter);
+}
+
+/// `npm start` builds: every parsed event goes to the terminal. DevTools stay
+/// opt-in so a development launch has the same one-window behavior as release.
 #[cfg(debug_assertions)]
 pub(crate) fn dev_log(events: &[parser::GameEvent], src: std::net::IpAddr) {
     for e in events {
@@ -672,13 +700,18 @@ pub(crate) fn dev_log(events: &[parser::GameEvent], src: std::net::IpAddr) {
                 let sz = satanic_here.map_or("-".into(), |b| b.to_string());
                 format!("vitals  mf {}  lv {level}  hlv {hlevel}  sz {sz}", say(mf))
             }
-            parser::GameEvent::ItemAdded { name, rarity, tier, ground, item_type, item_id, weapon_type, .. } => {
+            parser::GameEvent::ItemAdded {
+                name,
+                rarity,
+                tier,
+                ground,
+                item_type,
+                item_id,
+                weapon_type,
+                ..
+            } => {
                 // an empty name means the item tables predate this item
-                let label = if name.is_empty() {
-                    format!("unknown {item_type}:{item_id}:{weapon_type}")
-                } else {
-                    name.clone()
-                };
+                let label = if name.is_empty() { format!("unknown {item_type}:{item_id}:{weapon_type}") } else { name.clone() };
                 format!("item  {label:?} rarity {rarity} tier {tier} {}", if *ground { "on the ground" } else { "picked up" })
             }
             parser::GameEvent::Found { finder, name } => format!("chat  {finder:?} found {name:?}"),
@@ -693,10 +726,7 @@ pub(crate) fn dev_log(_: &[parser::GameEvent], _: std::net::IpAddr) {}
 
 #[cfg(windows)]
 fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_default()
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_default()
 }
 
 /// Everything the app writes lives here. On Windows that is the folder the
@@ -754,11 +784,7 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let stem = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let staged = path.with_file_name(format!(
-        "{stem}.{}.{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let staged = path.with_file_name(format!("{stem}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
     // The rename is atomic, but only over what the disk actually holds: without
     // this the metadata operation can land while the bytes are still in the
     // cache, and a power cut leaves the new name pointing at an empty file —
@@ -828,11 +854,7 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::pa
         Ok(raw) => raw,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                log::once(
-                    &path.display().to_string(),
-                    "error",
-                    format!("cannot read {}: {e}", path.display()),
-                );
+                log::once(&path.display().to_string(), "error", format!("cannot read {}: {e}", path.display()));
             }
             return T::default();
         }
@@ -840,10 +862,7 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::pa
     match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(e) => {
-            let kept = path.with_file_name(format!(
-                "{}.bad",
-                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-            ));
+            let kept = path.with_file_name(format!("{}.bad", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
             let moved = std::fs::rename(path, &kept);
             log::error(format!(
                 "{} does not parse ({e}); {}",
@@ -878,10 +897,7 @@ fn carried_path() -> PathBuf {
 /// them when it saves, so without this a restart shows zeros until the next
 /// save — which can be a whole farming run away.
 fn read_carried() -> stats::Carried {
-    std::fs::read_to_string(carried_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    std::fs::read_to_string(carried_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn save_carried(app: &AppHandle) {
@@ -900,7 +916,9 @@ const REMEMBERED_WINDOWS: [&str; 3] = ["main", "dashboard", "flourish"];
 fn window_positions(app: &AppHandle) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     for label in REMEMBERED_WINDOWS {
-        let Some(w) = app.get_webview_window(label) else { continue };
+        let Some(w) = app.get_webview_window(label) else {
+            continue;
+        };
         if !on_screen(&w) {
             // keep whatever the last run knew rather than overwrite it with junk
             if let Some(pos) = parked(label) {
@@ -972,8 +990,12 @@ fn spawn_position_saver(app: AppHandle) {
 
 /// Restore saved positions, but only onto a connected monitor.
 fn restore_window_positions(app: &AppHandle) {
-    let Ok(saved) = std::fs::read_to_string(positions_path()) else { return };
-    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&saved) else { return };
+    let Ok(saved) = std::fs::read_to_string(positions_path()) else {
+        return;
+    };
+    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&saved) else {
+        return;
+    };
     let monitors = app.available_monitors().unwrap_or_default();
     let on_screen = |x: i32, y: i32| {
         monitors.iter().any(|m| {
@@ -983,28 +1005,102 @@ fn restore_window_positions(app: &AppHandle) {
         })
     };
     for label in REMEMBERED_WINDOWS {
-        let Some(pos) = map.get(label).and_then(|v| v.as_array()) else { continue };
+        let Some(pos) = map.get(label).and_then(|v| v.as_array()) else {
+            continue;
+        };
         let (Some(x), Some(y)) = (pos.first().and_then(|v| v.as_i64()), pos.get(1).and_then(|v| v.as_i64())) else {
             continue;
         };
         if !on_screen(x as i32, y as i32) {
             continue;
         }
-        let Some(w) = app.get_webview_window(label) else { continue };
+        let Some(w) = app.get_webview_window(label) else {
+            continue;
+        };
         // seed the in-memory copy too: a window that starts hidden has no
         // geometry of its own to save later, and this is where it comes from
         park(label, tauri::PhysicalPosition::new(x as i32, y as i32));
         let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
         // older files hold just a position; a size only comes back if it fits
-        if let (Some(width), Some(height)) = (
-            pos.get(2).and_then(|v| v.as_u64()),
-            pos.get(3).and_then(|v| v.as_u64()),
-        ) {
+        if let (Some(width), Some(height)) = (pos.get(2).and_then(|v| v.as_u64()), pos.get(3).and_then(|v| v.as_u64())) {
             if width >= 200 && height >= 200 {
                 let _ = w.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
             }
         }
     }
+}
+
+#[derive(Serialize)]
+struct LaunchMonitor {
+    id: String,
+    label: String,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    primary: bool,
+}
+
+/// Tauri exposes the operating system's stable display name where it has one.
+/// Geometry is the fallback on desktops that do not name their outputs.
+fn launch_monitor_id(monitor: &tauri::Monitor) -> String {
+    monitor.name().filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| {
+        let (p, s) = (monitor.position(), monitor.size());
+        format!("geometry:{}:{}:{}:{}", p.x, p.y, s.width, s.height)
+    })
+}
+
+#[tauri::command]
+fn get_monitors(app: AppHandle) -> Vec<LaunchMonitor> {
+    let primary = app.primary_monitor().ok().flatten().map(|m| launch_monitor_id(&m));
+    app.available_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, monitor)| {
+            let id = launch_monitor_id(&monitor);
+            let (p, s) = (monitor.position(), monitor.size());
+            let name = monitor
+                .name()
+                .map(|name| name.trim_start_matches("\\\\.\\").to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("Monitor {}", index + 1));
+            LaunchMonitor {
+                label: format!("{} — {}×{}", name, s.width, s.height),
+                width: s.width,
+                height: s.height,
+                x: p.x,
+                y: p.y,
+                primary: primary.as_deref() == Some(id.as_str()),
+                id,
+            }
+        })
+        .collect()
+}
+
+/// A selected launch monitor overrides remembered coordinates for the face
+/// that actually opens. Leaving the setting empty preserves the old behavior.
+fn place_launch_face(app: &AppHandle, settings: &Settings, compact: bool) {
+    if settings.launch_monitor.is_empty() || !can_place_windows() {
+        return;
+    }
+    let monitors = app.available_monitors().unwrap_or_default();
+    let monitor = monitors
+        .iter()
+        .find(|monitor| launch_monitor_id(monitor) == settings.launch_monitor)
+        .cloned()
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .or_else(|| monitors.into_iter().next());
+    let Some(monitor) = monitor else { return };
+    let label = if compact { "main" } else { "dashboard" };
+    let Some(window) = app.get_webview_window(label) else { return };
+    let Ok(size) = window.outer_size() else { return };
+    let (origin, screen) = (monitor.position(), monitor.size());
+    let x = origin.x + (screen.width.saturating_sub(size.width) / 2) as i32;
+    let y = origin.y + (screen.height.saturating_sub(size.height) / 2) as i32;
+    let pos = tauri::PhysicalPosition::new(x, y);
+    park(label, pos);
+    let _ = window.set_position(pos);
 }
 
 /// The drop ticker is a pure display glued right under the overlay: always
@@ -1014,13 +1110,10 @@ fn spawn_ticker_glue(app: AppHandle) {
         let mut shown = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let (Some(main), Some(ticker)) = (app.get_webview_window("main"), app.get_webview_window("ticker"))
-            else {
+            let (Some(main), Some(ticker)) = (app.get_webview_window("main"), app.get_webview_window("ticker")) else {
                 continue;
             };
-            let visible = main.is_visible().unwrap_or(false)
-                && TICKER.load(Ordering::Relaxed)
-                && TICKER_BUSY.load(Ordering::Relaxed);
+            let visible = main.is_visible().unwrap_or(false) && TICKER.load(Ordering::Relaxed) && TICKER_BUSY.load(Ordering::Relaxed);
             if !visible {
                 if shown {
                     let _ = ticker.hide();
@@ -1045,11 +1138,7 @@ fn spawn_ticker_glue(app: AppHandle) {
                 let panel = (PANEL_H.load(Ordering::Relaxed) as f64 * scale * dpi) as i32;
                 let tall = if panel > 0 { panel } else { size.height as i32 };
                 let below = pos.y + tall + 4;
-                let floor = main
-                    .current_monitor()
-                    .ok()
-                    .flatten()
-                    .map(|m| m.position().y + m.size().height as i32);
+                let floor = main.current_monitor().ok().flatten().map(|m| m.position().y + m.size().height as i32);
                 let y = match floor {
                     Some(bottom) if below + height as i32 > bottom => pos.y - height as i32 - 4,
                     _ => below,
@@ -1090,7 +1179,6 @@ fn spawn_ticker_glue(app: AppHandle) {
         }
     });
 }
-
 
 /// Counters are pushed, not polled: the webviews used to ask for a snapshot
 /// twice a second each — the statistics view even asked for the whole graph
@@ -1173,9 +1261,7 @@ fn spawn_stats_pusher(app: AppHandle) {
             let shared = app.state::<Shared>();
             let revision = shared.stats().revision();
 
-            let due = |rev: u64, at: Instant, gap: Duration, beat: Duration| {
-                (rev != revision && at.elapsed() >= gap) || at.elapsed() >= beat
-            };
+            let due = |rev: u64, at: Instant, gap: Duration, beat: Duration| (rev != revision && at.elapsed() >= gap) || at.elapsed() >= beat;
             if due(snap_rev, snap_at, SNAP_MIN_GAP, SNAP_HEARTBEAT) {
                 let status = shared.status().text();
                 let snapshot = shared.stats().snapshot(status);
@@ -1231,7 +1317,11 @@ fn migrate_lists(settings: &mut Settings) {
         return;
     }
     let lists = std::mem::take(&mut settings.lists);
-    settings.filters.push(SoundFilter { id: "mine".into(), name: "My filter".into(), lists });
+    settings.filters.push(SoundFilter {
+        id: "mine".into(),
+        name: "My filter".into(),
+        lists,
+    });
     if settings.filter.is_empty() {
         settings.filter = "mine".into();
     }
@@ -1258,15 +1348,8 @@ fn migrate_notable(settings: &mut Settings) {
 }
 
 fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
-    let active = settings
-        .use_filter
-        .then(|| settings.filters.iter().find(|f| f.id == settings.filter))
-        .flatten();
-    let mut notable: Vec<(String, Vec<String>)> = settings
-        .notable
-        .iter()
-        .map(|g| (g.label.clone(), g.names.iter().map(|n| n.to_lowercase()).collect()))
-        .collect();
+    let active = settings.use_filter.then(|| settings.filters.iter().find(|f| f.id == settings.filter)).flatten();
+    let mut notable: Vec<(String, Vec<String>)> = settings.notable.iter().map(|g| (g.label.clone(), g.names.iter().map(|n| n.to_lowercase()).collect())).collect();
     if notable.is_empty() {
         notable = stats::default_notable();
     }
@@ -1274,12 +1357,7 @@ fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
         prefer_ground: settings.sound_on_ground,
         // a rarity dropped from the tracked list must stop alerting even if an
         // older settings file still names it
-        alerts: settings
-            .alerts
-            .iter()
-            .filter(|r| stats::JOURNAL_RARITIES.contains(&r.as_str()))
-            .cloned()
-            .collect(),
+        alerts: settings.alerts.iter().filter(|r| stats::JOURNAL_RARITIES.contains(&r.as_str())).cloned().collect(),
         min_tier: settings.min_tier,
         // the flourish asks a different question of the same drop
         fx_rarities: if settings.flourish { settings.flourish_rarities.clone() } else { Vec::new() },
@@ -1295,8 +1373,7 @@ fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
                     .iter()
                     .filter(|l| l.enabled && !l.id.is_empty() && !l.items.is_empty())
                     .map(|l| {
-                        let names =
-                            l.items.iter().map(|n| n.trim().to_lowercase()).collect::<Vec<_>>();
+                        let names = l.items.iter().map(|n| n.trim().to_lowercase()).collect::<Vec<_>>();
                         (format!("list-{}", l.id), names)
                     })
                     .collect()
@@ -1444,9 +1521,7 @@ fn spawn_strip_poller(app: AppHandle) {
 fn apply_autostart(enabled: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
-    let Ok(run) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", winreg::enums::KEY_ALL_ACCESS)
-    else {
+    let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", winreg::enums::KEY_ALL_ACCESS) else {
         return;
     };
     let _ = run.delete_value("HS Companion"); // pre-rename entry
@@ -1476,9 +1551,7 @@ fn apply_autostart(enabled: bool) {
     }
     // Inside an AppImage the running binary lives on a mount that is gone by
     // the next login; $APPIMAGE is the file the user actually keeps.
-    let target = std::env::var_os("APPIMAGE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok());
+    let target = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
     let Some(target) = target else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -1486,9 +1559,7 @@ fn apply_autostart(enabled: bool) {
     // Exec is parsed as an argv, so a path with a space has to be quoted, and
     // the spec's own escapes have to survive quoting
     let quoted = format!("\"{}\"", target.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
-    let desktop = format!(
-        "[Desktop Entry]\nType=Application\nName=HS Tracker\nComment=Hero Siege session tracker\nExec={quoted}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
-    );
+    let desktop = format!("[Desktop Entry]\nType=Application\nName=HS Tracker\nComment=Hero Siege session tracker\nExec={quoted}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n");
     let _ = std::fs::write(entry, desktop);
 }
 
@@ -1540,6 +1611,9 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<(), String> {
     settings.opacity = settings.opacity.clamp(0.3, 1.0);
     settings.scale = settings.scale.clamp(0.6, 1.5);
     settings.min_tier = settings.min_tier.clamp(0, 20);
+    if !matches!(settings.number_display.as_str(), "standard" | "hero-siege" | "full") {
+        settings.number_display = "standard".into();
+    }
     // Applied before it is written. The other way round, a setting that kills
     // the process on the way in is already on disk when it does — and every
     // later start reads it back and dies again, with no way to the panel that
@@ -1749,7 +1823,9 @@ pub(crate) fn maybe_flourish(app: &AppHandle, drop: &stats::DropEntry) {
             seen.push((drop.name.clone(), Instant::now()));
         }
     }
-    let Some(w) = app.get_webview_window("flourish") else { return };
+    let Some(w) = app.get_webview_window("flourish") else {
+        return;
+    };
     let _ = app.emit_to("flourish", "flourish-play", drop);
     show_flourish(app, &w);
 }
@@ -1764,7 +1840,9 @@ fn maybe_zone_flourish(app: &AppHandle, zone: &stats::SatanicZone) {
     if !FLOURISH.load(Ordering::Relaxed) || !FLOURISH_ZONE.load(Ordering::Relaxed) {
         return;
     }
-    let Some(w) = app.get_webview_window("flourish") else { return };
+    let Some(w) = app.get_webview_window("flourish") else {
+        return;
+    };
     // The raw zone code, not a name. Turning `Satanic_5_5` into "Act 5 : Temple
     // of Zamjo" needs a table of forty room names that the window already has
     // and this side has no other use for.
@@ -1950,14 +2028,10 @@ fn show_log() -> Result<(), String> {
     #[cfg(windows)]
     let spawned = {
         use std::os::windows::process::CommandExt as _;
-        std::process::Command::new("explorer")
-            .raw_arg(format!("/select,\"{}\"", file.display()))
-            .spawn()
+        std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", file.display())).spawn()
     };
     #[cfg(not(windows))]
-    let spawned = std::process::Command::new("xdg-open")
-        .arg(file.parent().unwrap_or(&file))
-        .spawn();
+    let spawned = std::process::Command::new("xdg-open").arg(file.parent().unwrap_or(&file)).spawn();
     reap(spawned).map_err(|e| e.to_string())
 }
 
@@ -1973,7 +2047,11 @@ fn about() -> About {
         overlay_w: panel_w() as u32,
         overlay_h: {
             let measured = PANEL_H.load(Ordering::Relaxed);
-            if measured > 0 { measured } else { 199 }
+            if measured > 0 {
+                measured
+            } else {
+                199
+            }
         },
         // inside an AppImage the running binary is on a mount that will be
         // gone; the file the user keeps is the one to name
@@ -2034,11 +2112,12 @@ fn hide_window(app: AppHandle) {
 /// and a window manager is free to place it afresh when it comes back — KWin
 /// centres it, which drags the overlay out from the corner the player put it
 /// in. Windows keeps the position by itself; restoring it there costs nothing.
-static PARKED: std::sync::Mutex<Vec<(String, tauri::PhysicalPosition<i32>)>> =
-    std::sync::Mutex::new(Vec::new());
+static PARKED: std::sync::Mutex<Vec<(String, tauri::PhysicalPosition<i32>)>> = std::sync::Mutex::new(Vec::new());
 
 fn park(label: &str, pos: tauri::PhysicalPosition<i32>) {
-    let Ok(mut parked) = PARKED.lock() else { return };
+    let Ok(mut parked) = PARKED.lock() else {
+        return;
+    };
     match parked.iter_mut().find(|(l, _)| l == label) {
         Some(slot) => slot.1 = pos,
         None => parked.push((label.to_string(), pos)),
@@ -2058,7 +2137,9 @@ fn show_aux(app: &AppHandle, label: &str) {
 /// asked for it: the overlay following the game must not pull focus out of the
 /// game it is following.
 fn reveal(app: &AppHandle, label: &str, focus: bool) {
-    let Some(w) = app.get_webview_window(label) else { return };
+    let Some(w) = app.get_webview_window(label) else {
+        return;
+    };
     // An iconified toplevel is still "visible" to GTK, so `show` on a minimised
     // window is a no-op — tray -> Dashboard after clicking minimise did nothing
     // at all, and on Wayland the tray is the only control there is.
@@ -2096,10 +2177,7 @@ fn on_a_monitor(app: &AppHandle, pos: tauri::PhysicalPosition<i32>) -> bool {
     monitors.is_empty()
         || monitors.iter().any(|m| {
             let (p, s) = (m.position(), m.size());
-            pos.x >= p.x - 50
-                && pos.x < p.x + s.width as i32
-                && pos.y >= p.y - 50
-                && pos.y < p.y + s.height as i32
+            pos.x >= p.x - 50 && pos.x < p.x + s.width as i32 && pos.y >= p.y - 50 && pos.y < p.y + s.height as i32
         })
 }
 
@@ -2124,6 +2202,13 @@ fn on_screen(w: &tauri::WebviewWindow) -> bool {
 /// The sniffer follows the game with these two. Showing the overlay must leave
 /// the keyboard with the game.
 pub(crate) fn show_overlay(app: &AppHandle) {
+    // Auto-show follows the game only while the app is otherwise tucked away.
+    // A dashboard the player deliberately launched or opened is already the
+    // app's visible face; revealing the overlay beside it produced two HS
+    // Tracker windows until Compact mode happened to hide the dashboard.
+    if app.get_webview_window("dashboard").is_some_and(|window| on_screen(&window)) {
+        return;
+    }
     reveal(app, "main", false);
 }
 
@@ -2253,9 +2338,7 @@ fn write_sound(dir: &std::path::Path, key: &str, snd: &ExportedSound) -> Result<
     if !sound_key(key) || !SOUND_EXTS.iter().any(|(e, _)| *e == snd.ext) {
         return Err("not a sound this app files".into());
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&snd.data)
-        .map_err(|e| e.to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(&snd.data).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // One key, one file — the rule `pick_sound` and `clear_sound` both keep.
     // Every reader takes the first extension of SOUND_EXTS that exists, so
@@ -2309,12 +2392,7 @@ fn export_filter(app: AppHandle, filter: SoundFilter) -> Result<Option<String>, 
     use tauri_plugin_dialog::DialogExt;
     let safe: String = filter.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '-' }).collect();
     let suggested = format!("{safe}.hstracker.json");
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("HS Tracker filter", &["json"])
-        .set_file_name(&suggested)
-        .blocking_save_file();
+    let picked = app.dialog().file().add_filter("HS Tracker filter", &["json"]).set_file_name(&suggested).blocking_save_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
@@ -2403,17 +2481,12 @@ fn export_settings(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command(async)]
 fn import_settings(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("HS Tracker settings", &["json"])
-        .blocking_pick_file();
+    let picked = app.dialog().file().add_filter("HS Tracker settings", &["json"]).blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let exported: ExportedSettings =
-        serde_json::from_str(&text).map_err(|_| "not an HS Tracker settings file".to_string())?;
+    let exported: ExportedSettings = serde_json::from_str(&text).map_err(|_| "not an HS Tracker settings file".to_string())?;
     if exported.app != "hs-tracker" || exported.kind != "settings" {
         return Err("not an HS Tracker settings file".into());
     }
@@ -2431,11 +2504,7 @@ fn import_settings(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command(async)]
 fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("HS Tracker filter", &["json"])
-        .blocking_pick_file();
+    let picked = app.dialog().file().add_filter("HS Tracker filter", &["json"]).blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
@@ -2451,10 +2520,7 @@ fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
         // that is already installed
         let id = format!("{:x}", now_id());
         if let Some(sound) = list.sound {
-            if let (true, Ok(bytes)) = (
-                SOUND_EXTS.iter().any(|(e, _)| *e == sound.ext),
-                base64::engine::general_purpose::STANDARD.decode(sound.data),
-            ) {
+            if let (true, Ok(bytes)) = (SOUND_EXTS.iter().any(|(e, _)| *e == sound.ext), base64::engine::general_purpose::STANDARD.decode(sound.data)) {
                 if bytes.len() <= 10 << 20 {
                     let _ = std::fs::write(sounds_dir().join(format!("list-{id}.{}", sound.ext)), bytes);
                 }
@@ -2468,16 +2534,18 @@ fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
             items: list.items,
         });
     }
-    Ok(Some(SoundFilter { id: format!("{:x}", now_id()), name: exported.name, lists }))
+    Ok(Some(SoundFilter {
+        id: format!("{:x}", now_id()),
+        name: exported.name,
+        lists,
+    }))
 }
 
 /// Short unique ids without pulling in a crate for it.
 fn now_id() -> u64 {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
     nanos.wrapping_add(SEQ.fetch_add(1, Ordering::Relaxed)) & 0xffff_ffff
 }
 
@@ -2554,17 +2622,8 @@ fn log_environment() {
         .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
         .map(|key| {
             let text = |name: &str| key.get_value::<String, _>(name).unwrap_or_else(|_| "-".into());
-            let patch = key
-                .get_value::<u32, _>("UBR")
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| "-".into());
-            format!(
-                "{} {} build {}.{}",
-                text("ProductName"),
-                text("DisplayVersion"),
-                text("CurrentBuild"),
-                patch
-            )
+            let patch = key.get_value::<u32, _>("UBR").map(|n| n.to_string()).unwrap_or_else(|_| "-".into());
+            format!("{} {} build {}.{}", text("ProductName"), text("DisplayVersion"), text("CurrentBuild"), patch)
         })
         .unwrap_or_else(|e| format!("Windows (unreadable: {e})"));
 
@@ -2573,9 +2632,7 @@ fn log_environment() {
     // be running a version nobody has ever tested against.
     let webview = tauri::webview_version().unwrap_or_else(|e| format!("unreadable ({e})"));
 
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "-".into());
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "-".into());
 
     // Written to, not asked about. A folder can exist, list fine and still
     // refuse a write — an install under Program Files does exactly that, and
@@ -2619,9 +2676,7 @@ fn retry_without_dmabuf() -> bool {
         return false;
     }
     // inside an AppImage the mounted binary is not what the user keeps
-    let Some(exe) =
-        std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok())
-    else {
+    let Some(exe) = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()) else {
         return false;
     };
     log::warn("nothing was drawn in 20s - restarting once with the DMA-BUF renderer off");
@@ -2682,10 +2737,7 @@ fn ticker_busy(active: bool) {
 
 #[tauri::command(async)]
 fn get_shopping() -> Vec<String> {
-    std::fs::read_to_string(shopping_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    std::fs::read_to_string(shopping_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 #[tauri::command(async)]
@@ -2704,9 +2756,7 @@ fn copy_text(text: String) -> Result<(), String> {
 }
 
 /// One clipboard, opened once. Both the shopping list and the run card use it.
-fn with_clipboard<T>(
-    job: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
-) -> Result<T, String> {
+fn with_clipboard<T>(job: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, String> {
     static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
     let mut guard = CLIPBOARD.lock().map_err(|_| "the clipboard is busy".to_string())?;
     if guard.is_none() {
@@ -2722,15 +2772,17 @@ fn with_clipboard<T>(
 /// carries JSON and a megabyte of numbers spelled out is not that.
 #[tauri::command]
 fn copy_image(width: u32, height: u32, rgba: String) -> Result<(), String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(rgba)
-        .map_err(|_| "the picture did not survive the trip".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(rgba).map_err(|_| "the picture did not survive the trip".to_string())?;
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || bytes.len() != w * h * 4 {
         return Err("the picture is not the size it says it is".into());
     }
     with_clipboard(|c| {
-        c.set_image(arboard::ImageData { width: w, height: h, bytes: bytes.into() })
+        c.set_image(arboard::ImageData {
+            width: w,
+            height: h,
+            bytes: bytes.into(),
+        })
     })
 }
 
@@ -2774,10 +2826,7 @@ fn sound_status(rarity: String) -> Option<String> {
     if !sound_key(&rarity) {
         return None;
     }
-    SOUND_EXTS
-        .iter()
-        .map(|(ext, _)| format!("{rarity}.{ext}"))
-        .find(|name| sounds_dir().join(name).exists())
+    SOUND_EXTS.iter().map(|(ext, _)| format!("{rarity}.{ext}")).find(|name| sounds_dir().join(name).exists())
 }
 
 /// Native picker + copy into sounds\; the webview's own file input is
@@ -2789,19 +2838,11 @@ fn pick_sound(app: AppHandle, rarity: String) -> Result<Option<String>, String> 
     if !sound_key(&rarity) {
         return Err("bad rarity".into());
     }
-    let picked = app
-        .dialog()
-        .file()
-        .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
-        .blocking_pick_file();
+    let picked = app.dialog().file().add_filter("Audio", &["mp3", "wav", "ogg", "flac"]).blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .unwrap_or_default();
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
     if !SOUND_EXTS.iter().any(|(e, _)| *e == ext) {
         return Err("unsupported format (mp3/wav/ogg/flac)".into());
     }
@@ -2848,8 +2889,7 @@ fn toggle_window(app: &AppHandle) {
     // `is_visible` alone stays true for a minimised window on both toolkits,
     // so clicking the tray icon to bring back a dashboard the player had just
     // minimised hid it instead — and the second click had to undo that first.
-    let visible =
-        |label: &str| app.get_webview_window(label).is_some_and(|w| on_screen(&w));
+    let visible = |label: &str| app.get_webview_window(label).is_some_and(|w| on_screen(&w));
     if visible("main") || visible("dashboard") {
         hide_aux(app, "main");
         hide_aux(app, "dashboard");
@@ -2936,16 +2976,11 @@ fn honour_backend_choice() {
         return; // no XWayland here at all
     }
     let _ = std::fs::write(&breadcrumb, "");
-    let started = std::process::Command::new(
-        std::env::var_os("APPIMAGE")
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_exe().ok())
-            .unwrap_or_default(),
-    )
-    .env("GDK_BACKEND", "x11")
-    .env("HS_TRACKER_RELAUNCHED", "1")
-    .spawn()
-    .is_ok();
+    let started = std::process::Command::new(std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).unwrap_or_default())
+        .env("GDK_BACKEND", "x11")
+        .env("HS_TRACKER_RELAUNCHED", "1")
+        .spawn()
+        .is_ok();
     if started {
         std::process::exit(0);
     }
@@ -2990,9 +3025,7 @@ fn ease_webkit() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some() {
         return;
     }
-    let nvidia = ["/dev/nvidiactl", "/sys/module/nvidia/version"]
-        .iter()
-        .any(|p| std::path::Path::new(p).exists());
+    let nvidia = ["/dev/nvidiactl", "/sys/module/nvidia/version"].iter().any(|p| std::path::Path::new(p).exists());
 
     let painting = data_dir().join("no-paint");
     let soft = data_dir().join("soft-render");
@@ -3085,6 +3118,7 @@ pub fn run() {
             copy_image,
             quit,
             get_settings,
+            get_monitors,
             save_settings,
             load_sound,
             sound_path,
@@ -3122,9 +3156,16 @@ pub fn run() {
             apply_stats_settings(app.handle(), &settings);
             apply_settings_effects(app.handle(), &settings);
             restore_window_positions(app.handle());
-            if settings.compact && overlay {
+            let launch_compact = settings.launch_compact && overlay;
+            place_launch_face(app.handle(), &settings, launch_compact);
+            if launch_compact {
                 hide_aux(app.handle(), "dashboard");
                 show_aux(app.handle(), "main");
+            }
+            if settings.compact != launch_compact {
+                let mut current = settings.clone();
+                current.compact = launch_compact;
+                let _ = save_settings(app.handle().clone(), current);
             }
             // click-through is set once the window exists on screen: off
             // Windows the call reaches into a native window that an unshown
@@ -3132,10 +3173,6 @@ pub fn run() {
             // overlay from the lock poller.
             if let Some(t) = app.get_webview_window("ticker") {
                 set_click_through(&t, true);
-            }
-            #[cfg(debug_assertions)]
-            if let Some(w) = app.get_webview_window("main") {
-                w.open_devtools();
             }
             // both of these only ever move or mask the overlay and the ticker
             if overlay {
@@ -3166,7 +3203,7 @@ pub fn run() {
             // single page has painted: a backend that builds windows and then
             // fails to render them looked like success. It is cleared once the
             // front end says it is up — see the `ui_ready` command.
-            
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -3280,16 +3317,7 @@ mod tests {
         for good in ["satanic", "set", "heroic", "angelic", "unholy", "mail", "zone", "list-9f3a2b", "list-a-b"] {
             assert!(sound_key(good), "{good} should be allowed");
         }
-        for bad in [
-            "list-../../etc/passwd",
-            "list-a/b",
-            "list-a\\b",
-            "../satanic",
-            "list-a.b",
-            "",
-            "satanic ",
-            "LIST-abc/..",
-        ] {
+        for bad in ["list-../../etc/passwd", "list-a/b", "list-a\\b", "../satanic", "list-a.b", "", "satanic ", "LIST-abc/.."] {
             assert!(!sound_key(bad), "{bad:?} should be refused");
         }
         // and the length ceiling, which is what stops a very long id at all
@@ -3333,11 +3361,7 @@ mod tests {
         let settings: Settings = read_json_or_default(&path);
         assert_eq!(settings.min_tier, Settings::default().min_tier, "defaults, as before");
         assert!(!path.exists(), "and not left where the next save overwrites it");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("settings.json.bad")).unwrap(),
-            wreck,
-            "the user's own file, kept whole"
-        );
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bad")).unwrap(), wreck, "the user's own file, kept whole");
 
         // a file that is simply not there is a first run, and stays quiet
         let fresh: Settings = read_json_or_default(&dir.join("nothing.json"));

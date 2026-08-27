@@ -7,13 +7,29 @@
 // artefact people paste into chat, so it was the one place the app spoke a
 // language of its own.
 //
-// Hero Siege itself says kk and kkk rather than M and B, which is why these
-// are not the SI suffixes a general-purpose helper would reach for.
+// Hero Siege itself says kk and kkk rather than M and B. That dialect is still
+// available, but it is a preference now rather than something every player is
+// forced to decipher.
+
+export const numberDisplay = $state({ style: 'standard' });
+
+export function setNumberDisplay(style) {
+  numberDisplay.style = ['standard', 'hero-siege', 'full'].includes(style)
+    ? style
+    : 'standard';
+}
 
 /** 1234 -> "1,234"; 12345 -> "12.3k"; 1234567 -> "1.23kk". */
 export function fmt(n) {
   const v = n ?? 0;
   const abs = Math.abs(v);
+  if (numberDisplay.style === 'full') return v.toLocaleString('en-US');
+  if (numberDisplay.style === 'standard') {
+    if (abs >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
+    if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}M`;
+    if (abs >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+    return v.toLocaleString('en-US');
+  }
   if (abs >= 1e9) return `${(v / 1e9).toFixed(2)}kkk`;
   if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}kk`;
   // below ten thousand the digits still fit, and reading them exactly is

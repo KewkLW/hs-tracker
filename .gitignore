@@ -22,6 +22,7 @@ runs.json
 # every capture, however it was named on the way in: these carry the session
 # identifier and checksum a client signs its requests with
 debug-capture*.jsonl
+market-observations*.jsonl
 /sounds/
 
 # datamined item tables: input for tools/gen_items.py, not ours to ship

@@ -1,10 +1,11 @@
 <script>
   import { invoke } from './bridge.js';
-  import { fmt, RARITIES, RARITY_CLASS, difficulty } from './format.js';
+  import { fmt, RARITIES, RARITY_CLASS, difficulty } from './format.svelte.js';
   import { art } from './skin.svelte.js';
   import { listen } from './bridge.js';
   import { tierLabel, zoneLabel } from './items.js';
   import { cardBytes, drawRunCard } from './runcard.js';
+  import { formatEta, heroXpRequired, levelForecast } from './xp.js';
 
   let runs = $state([]);
   let picked = $state(0);
@@ -39,12 +40,41 @@
     return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
   }
 
+  function levelDur(secs) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+    if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+    return `${s}s`;
+  }
+
   const day = (ms) =>
     new Date(ms).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+  const clock = (ms) =>
+    new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 
   const perHour = (value, secs) => (secs > 0 ? Math.round((value * 3600) / secs) : 0);
 
   let run = $derived(runs[picked] ?? null);
+
+  let heroXp = $derived.by(() => {
+    if (!run || run.level < 100 || run.xp_in_level == null) return null;
+    const level = Math.max(0, run.herolevel ?? 0);
+    const required = heroXpRequired(level);
+    if (!required) return null;
+    const current = Math.max(0, run.xp_in_level);
+    const rate = perHour(run.xp, run.secs);
+    return {
+      level,
+      current,
+      required,
+      percent: Math.min(100, (current / required) * 100),
+      rate,
+      rows: levelForecast(level, current, rate, 10),
+    };
+  });
 
   // what a run is worth in one line, for the list
   const headline = (r) => `${fmt(r.gold)} gold · ${fmt(r.kills)} kills`;
@@ -60,6 +90,9 @@
   const chests = (r) => tallies(r, 'chest');
 
   let armed = $state(false);
+  let starting = $state(false);
+  let started = $state(false);
+  let startedTimer;
 
   // The card is a picture on purpose: a run pasted into a chat as text loses
   // its shape, and a screenshot of the panel drags the whole window along.
@@ -95,6 +128,23 @@
       .then(() => (runs = []))
       .catch(() => {});
   }
+
+  async function startNewRun() {
+    if (starting) return;
+    starting = true;
+    started = false;
+    clearTimeout(startedTimer);
+    try {
+      // The backend files the current run first, then resets every live
+      // counter and its clock. It is the same path as Ctrl+Shift+R, exposed
+      // here where the resulting history can be seen immediately.
+      await invoke('reset_stats');
+      started = true;
+      startedTimer = setTimeout(() => (started = false), 1800);
+    } finally {
+      starting = false;
+    }
+  }
 </script>
 
 <div class="panel">
@@ -114,16 +164,30 @@
             </button>
           {/each}
         </div>
-        <button
-          class="btn"
-          class:armed
-          style:--btn="url({art('button')})"
-          style:--btn-hover="url({art('button_hover')})"
-          style:--btn-down="url({art('button_down')})"
-          onclick={clearAll}
-        >
-          {armed ? 'Sure? — this cannot be undone' : 'Clear history'}
-        </button>
+        <div class="actions">
+          <button
+            class="btn"
+            style:--btn="url({art('button')})"
+            style:--btn-hover="url({art('button_hover')})"
+            style:--btn-down="url({art('button_down')})"
+            onclick={startNewRun}
+            disabled={starting}
+            title="Save the current run and begin a fresh one now"
+          >
+            {starting ? 'Starting…' : started ? 'Run started' : 'Start new run'}
+          </button>
+          <button
+            class="btn"
+            class:armed
+            style:--btn="url({art('button')})"
+            style:--btn-hover="url({art('button_hover')})"
+            style:--btn-down="url({art('button_down')})"
+            onclick={clearAll}
+            title={armed ? 'Click again to permanently delete every saved run' : 'Delete saved run history'}
+          >
+            {armed ? 'Confirm clear' : 'Clear history'}
+          </button>
+        </div>
       </div>
 
       {#if run}
@@ -170,6 +234,62 @@
               </div>
             </div>
           </div>
+
+          {#if heroXp}
+            <div class="box level-forecast" style:border-image-source="url({art('chip_dark')})">
+              <div class="head">
+                <span class="accent">Level forecast</span>
+                <span class="right">at this run's {fmt(heroXp.rate)}/h · community curve estimate</span>
+              </div>
+              <div class="level-now">
+                <div class="level-summary">
+                  <span>HLv {heroXp.level}</span>
+                  <b>{fmt(heroXp.current)} / {fmt(heroXp.required)} XP</b>
+                </div>
+                <div class="level-track" title="Progress through the hero level when this run ended">
+                  <span style:width={`${heroXp.percent}%`}></span>
+                </div>
+              </div>
+              <div class="forecast-head">
+                <span>target</span><span>XP from run end</span><span>ETA</span>
+              </div>
+              <div class="forecast-rows">
+                {#each heroXp.rows as row, i}
+                  <div class="forecast-row" class:first={i === 0}>
+                    <span>HLv {row.level}</span>
+                    <span>{fmt(row.cumulativeXp)}</span>
+                    <b>{formatEta(row.etaSeconds)}</b>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if run.level_splits?.length}
+            <div class="box" style:border-image-source="url({art('chip_dark')})">
+              <div class="head">
+                <span class="accent">Level times</span>
+                <span class="right">active playtime</span>
+              </div>
+              <div class="split-rows">
+                {#each run.level_splits as split}
+                  <div class="split-row">
+                    <span class:hero={split.hero}>
+                      {split.hero ? 'HLv' : 'Lv'} {split.from_level} → {split.to_level}
+                    </span>
+                    <span class="dim">{clock(split.ended_ms)}</span>
+                    <b>{levelDur(split.secs)}</b>
+                    {#if split.partial}
+                      <span
+                        class="partial"
+                        title="The tracker first saw this level after progress had already been made"
+                      >observed remainder</span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
 
           <div class="box" style:border-image-source="url({art('chip_dark')})">
             <div class="head"><span class="accent">Loot</span></div>
@@ -391,6 +511,59 @@
   .value { font-size: 16px; line-height: 20px; }
   .sub { font-size: 10px; color: var(--edge-8); }
 
+  .level-now { display: flex; flex-direction: column; gap: 3px; padding: 3px 2px 5px; }
+  .level-summary { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .level-summary b { color: #b989df; font-weight: normal; }
+  .level-track {
+    height: 6px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--ground-10);
+  }
+  .level-track span { display: block; height: 100%; min-width: 1px; background: #8d55bd; }
+  .forecast-head,
+  .forecast-row {
+    display: grid;
+    grid-template-columns: 70px 1fr 72px;
+    gap: 8px;
+    align-items: baseline;
+    padding: 2px 4px;
+  }
+  .forecast-head {
+    color: var(--edge-2b);
+    font-size: 9px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+  }
+  .forecast-head span:nth-child(n + 2),
+  .forecast-row span:nth-child(2),
+  .forecast-row b { text-align: right; }
+  .forecast-rows { display: flex; flex-direction: column; gap: 1px; }
+  .forecast-row { background: rgba(0, 0, 0, 0.12); color: var(--bone-6); }
+  .forecast-row:nth-child(even) { background: rgba(0, 0, 0, 0.22); }
+  .forecast-row.first { color: var(--bone-11); }
+  .forecast-row.first b { color: #b989df; }
+
+  .split-rows { display: flex; flex-direction: column; gap: 1px; }
+  .split-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 68px;
+    gap: 8px;
+    align-items: baseline;
+    padding: 3px 4px;
+    background: rgba(0, 0, 0, 0.14);
+  }
+  .split-row:nth-child(even) { background: rgba(0, 0, 0, 0.23); }
+  .split-row .hero { color: #b989df; }
+  .split-row b { color: var(--bone-11); font-weight: normal; text-align: right; }
+  .partial {
+    grid-column: 1 / -1;
+    color: var(--edge-8);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
   /* the same small caption Stats uses over its own tallies */
   .subhead {
     font-size: 9px;
@@ -466,7 +639,15 @@
   }
   .btn:hover { border-image-source: var(--btn-hover); }
   .btn:active { border-image-source: var(--btn-down); }
+  .btn:disabled { opacity: 0.65; cursor: default; }
   .btn.armed { color: #f0c0c0; }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .actions .btn { flex: 1 1 105px; }
 
   .card-btn {
     font: inherit;

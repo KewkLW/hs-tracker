@@ -4,7 +4,7 @@
   import { listen, native } from './bridge.js';
   import { buffInfo, defaultBuffIcon, zoneAct, zoneName, icon } from './buffs.js';
   import { RARITIES, soundUrl, play } from './audio.js';
-  import { fmt } from './format.js';
+  import { fmt } from './format.svelte.js';
 
   let snap = $state(null);
 

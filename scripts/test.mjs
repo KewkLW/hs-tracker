@@ -12,6 +12,11 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const manifest = join('src-tauri', 'Cargo.toml');
 
+execFileSync(process.execPath, ['--test', 'src/xp.test.js'], {
+  cwd: root,
+  stdio: 'inherit',
+});
+
 const [file, argv] =
   process.platform === 'win32'
     ? ['cmd', ['/c', join(root, 'test.cmd'), ...args]]

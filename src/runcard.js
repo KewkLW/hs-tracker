@@ -9,7 +9,7 @@
 // them on the clipboard.
 
 import { zoneLabel } from './items.js';
-import { fmt, difficulty } from './format.js';
+import { fmt, difficulty } from './format.svelte.js';
 
 const W = 760;
 const H = 430;

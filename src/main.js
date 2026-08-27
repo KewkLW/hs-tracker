@@ -1,6 +1,7 @@
 import { mount } from 'svelte';
 import './theme.css';
 import { wearSkin } from './skin.svelte.js';
+import { setNumberDisplay } from './format.svelte.js';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import App from './App.svelte';
 import Dashboard from './Dashboard.svelte';
@@ -55,10 +56,19 @@ const wearTheme = (name) => {
 // enough to draw one frame in the wrong colours. The last answer is kept here
 // and worn immediately; the real one arrives a moment later and corrects it.
 wearTheme(recall('theme'));
+setNumberDisplay(recall('number-display') ?? 'standard');
 invoke('get_settings')
-  .then((s) => wearTheme(s?.theme))
+  .then((s) => {
+    wearTheme(s?.theme);
+    setNumberDisplay(s?.number_display);
+    remember('number-display', s?.number_display ?? 'standard');
+  })
   .catch(() => {});
-listen('settings-changed', (e) => wearTheme(e.payload?.theme));
+listen('settings-changed', (e) => {
+  wearTheme(e.payload?.theme);
+  setNumberDisplay(e.payload?.number_display);
+  remember('number-display', e.payload?.number_display ?? 'standard');
+});
 
 // The window's own label says which face to draw. There is one other way in —
 // a webview built without Tauri under it, which is what a test harness gets —

@@ -125,9 +125,7 @@ pub struct TallyCount {
 /// level-100 runes. Override the whole list in settings.json if the game
 /// regrades anything.
 pub fn default_notable() -> Vec<(String, Vec<String>)> {
-    let group = |label: &str, names: &[&str]| {
-        (label.to_string(), names.iter().map(|n| n.to_lowercase()).collect())
-    };
+    let group = |label: &str, names: &[&str]| (label.to_string(), names.iter().map(|n| n.to_lowercase()).collect());
     vec![
         group("Angelic Key", &["Angelic Key"]),
         group("Satanic Dice", &["Satanic Dice"]),
@@ -148,10 +146,7 @@ const JOURNAL_CAP: usize = 400;
 const SERIES_CAP: usize = 4000;
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -247,6 +242,11 @@ pub struct Run {
     pub season: i64,
     pub gold: i64,
     pub xp: i64,
+    /// Experience already banked inside the character's ending level. Older
+    /// runs do not have this, so keep absence distinct from a real zero: the
+    /// Runs panel must not invent a starting point for their forecasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xp_in_level: Option<i64>,
     pub kills: i64,
     /// rarity -> how many dropped
     pub items: HashMap<String, i64>,
@@ -256,6 +256,35 @@ pub struct Run {
     /// bosses put down and chests opened; absent from runs filed before 0.9.8
     #[serde(default)]
     pub tallies: Vec<TallyCount>,
+    /// Character and hero levels completed while this run was being recorded.
+    /// The timer is active playtime and may have begun in an earlier run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub level_splits: Vec<LevelSplit>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LevelSplit {
+    pub hero: bool,
+    pub from_level: i64,
+    pub to_level: i64,
+    pub secs: u64,
+    pub ended_ms: u64,
+    /// The tracker first saw this level after some XP had already been earned,
+    /// so `secs` is only the observed remainder rather than a full-level time.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+#[derive(Clone)]
+struct LevelMark {
+    name: String,
+    level: i64,
+    herolevel: i64,
+    /// Active seconds accumulated in earlier runs/app processes.
+    accumulated_secs: u64,
+    /// Position on this GameStats instance's active clock.
+    since_secs: u64,
+    partial: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -421,6 +450,8 @@ pub struct GameStats {
     account: Option<String>,
     announced_at: HashMap<String, Instant>,
     character: Option<CharacterInfo>,
+    level_mark: Option<LevelMark>,
+    level_splits: Vec<LevelSplit>,
     drops: VecDeque<DropEntry>,
     series: Vec<SeriesPoint>,
     /// bumped by every change, so the pusher can skip unchanged snapshots
@@ -535,6 +566,8 @@ impl Default for GameStats {
             account: None,
             announced_at: HashMap::new(),
             character: None,
+            level_mark: None,
+            level_splits: Vec::new(),
             drops: VecDeque::new(),
             series: Vec::new(),
             revision: 0,
@@ -558,13 +591,21 @@ fn act_of_room(room: &str) -> Option<i64> {
     digits.parse().ok().filter(|n| *n > 0)
 }
 
-
 impl GameStats {
     /// Character, zone and the diff baselines survive a session reset — only
     /// the earned counters restart, so the next packet still yields a diff.
     pub fn reset(&mut self) {
         let revision = self.revision;
         let extra_rev = self.extra_rev;
+        // Level timing is longer-lived than a farm run. A manual reset in the
+        // middle of a level starts fresh counters, not a fresh level, so bank
+        // the active portion and resume it from zero on the next run's clock.
+        let active_secs = self.active().as_secs();
+        let level_mark = self.level_mark.take().map(|mut mark| {
+            mark.accumulated_secs += active_secs.saturating_sub(mark.since_secs);
+            mark.since_secs = 0;
+            mark
+        });
         // These travel with `satanic` below rather than in the carry tuple,
         // which is long enough: a zone without the region it was answered for
         // reads as though a different region had asked, and the next reply is
@@ -666,6 +707,7 @@ impl GameStats {
             self.has_mail,
             self.baseline_for,
         ) = carry;
+        self.level_mark = level_mark;
         // The room travels; without this its clock does not, and the room the
         // next session starts in banks no time at all. Reset while standing in
         // one place and farm there for half an hour, and the run card's "where
@@ -711,6 +753,14 @@ impl GameStats {
         self.total_kills = carried.kills.max(0);
         self.stale_bank = carried.gold > 0;
         self.stale_save = carried.xp > 0 || carried.kills > 0;
+        self.level_mark = carried.level.as_ref().map(|level| LevelMark {
+            name: level.name.clone(),
+            level: level.level,
+            herolevel: level.herolevel,
+            accumulated_secs: level.elapsed_secs,
+            since_secs: self.active().as_secs(),
+            partial: level.partial,
+        });
     }
 
     pub fn carried(&self) -> Carried {
@@ -719,6 +769,83 @@ impl GameStats {
             mode: self.gold_mode.map(|m| m.to_string()),
             xp: self.total_xp,
             kills: self.total_kills,
+            level: self.level_mark.as_ref().map(|mark| CarriedLevel {
+                name: mark.name.clone(),
+                level: mark.level,
+                herolevel: mark.herolevel,
+                elapsed_secs: mark.accumulated_secs + self.active().as_secs().saturating_sub(mark.since_secs),
+                partial: mark.partial,
+            }),
+        }
+    }
+
+    /// Observe a save's level counters and close any level timer it advances.
+    /// Saves can occasionally skip a value; such a jump stays one honest,
+    /// combined observation instead of splitting time between levels by guess.
+    fn observe_levels(&mut self, name: &str, level: i64, herolevel: i64) {
+        if name.is_empty() || level <= 0 || herolevel < 0 {
+            return;
+        }
+        let now = self.active().as_secs();
+        let Some(mark) = self.level_mark.take() else {
+            self.level_mark = Some(LevelMark {
+                name: name.to_string(),
+                level,
+                herolevel,
+                accumulated_secs: 0,
+                since_secs: now,
+                partial: true,
+            });
+            return;
+        };
+
+        // Another character, a rebirth, or any rollback is a new baseline.
+        if mark.name != name || level < mark.level || herolevel < mark.herolevel {
+            self.level_mark = Some(LevelMark {
+                name: name.to_string(),
+                level,
+                herolevel,
+                accumulated_secs: 0,
+                since_secs: now,
+                partial: true,
+            });
+            return;
+        }
+
+        let elapsed = mark.accumulated_secs + now.saturating_sub(mark.since_secs);
+        let ended_ms = now_ms();
+        if level > mark.level {
+            self.level_splits.push(LevelSplit {
+                hero: false,
+                from_level: mark.level,
+                to_level: level,
+                secs: elapsed,
+                ended_ms,
+                partial: mark.partial,
+            });
+        }
+        if herolevel > mark.herolevel {
+            self.level_splits.push(LevelSplit {
+                hero: true,
+                from_level: mark.herolevel,
+                to_level: herolevel,
+                secs: elapsed,
+                ended_ms,
+                partial: mark.partial,
+            });
+        }
+
+        if level > mark.level || herolevel > mark.herolevel {
+            self.level_mark = Some(LevelMark {
+                name: name.to_string(),
+                level,
+                herolevel,
+                accumulated_secs: 0,
+                since_secs: now,
+                partial: false,
+            });
+        } else {
+            self.level_mark = Some(mark);
         }
     }
 
@@ -816,11 +943,13 @@ impl GameStats {
             season: self.character.as_ref().map_or(0, |c| c.season),
             gold: self.gold_earned,
             xp: self.xp_earned,
+            xp_in_level: self.xp_authoritative.then_some(self.total_xp.max(0)),
             kills: self.kills_earned,
             items: self.items.iter().map(|(name, c)| (name.to_string(), c.total)).collect(),
             notable,
             zones,
             tallies: self.tallies(),
+            level_splits: self.level_splits.clone(),
         })
     }
 
@@ -934,11 +1063,7 @@ impl GameStats {
             return None;
         }
         let lower = name.to_lowercase();
-        self.prefs
-            .sound_lists
-            .iter()
-            .find(|(_, names)| names.contains(&lower))
-            .map(|(key, _)| key.clone())
+        self.prefs.sound_lists.iter().find(|(_, names)| names.contains(&lower)).map(|(key, _)| key.clone())
     }
 
     /// Every setting at once.
@@ -982,12 +1107,7 @@ impl GameStats {
     #[cfg(test)]
     pub fn set_sound_lists(&mut self, lists: Vec<(String, Vec<String>)>) {
         self.revision += 1;
-        self.prefs.sound_lists = lists
-            .into_iter()
-            .map(|(key, names)| {
-                (key, names.into_iter().map(|n| n.trim().to_lowercase()).collect())
-            })
-            .collect();
+        self.prefs.sound_lists = lists.into_iter().map(|(key, names)| (key, names.into_iter().map(|n| n.trim().to_lowercase()).collect())).collect();
     }
 
     fn count_notable(&mut self, name: &str, amount: i64) {
@@ -1001,9 +1121,7 @@ impl GameStats {
             .prefs
             .notable_defs
             .iter()
-            .find(|(_, names)| {
-                names.iter().any(|n| *n == lower || n.trim_end_matches(" rune") == bare)
-            })
+            .find(|(_, names)| names.iter().any(|n| *n == lower || n.trim_end_matches(" rune") == bare))
             .map(|(label, _)| label.clone());
         if let Some(label) = label {
             *self.notable.entry(label).or_insert(0) += amount;
@@ -1042,7 +1160,9 @@ impl GameStats {
     /// chime of its own in the first seconds is a smaller wrong than one that
     /// announces the whole shard's luck.
     fn is_us(&self, who: &str) -> bool {
-        let Some(me) = self.character.as_ref().map(|c| c.name.trim()) else { return false };
+        let Some(me) = self.character.as_ref().map(|c| c.name.trim()) else {
+            return false;
+        };
         !me.is_empty() && me.eq_ignore_ascii_case(who.trim())
     }
 
@@ -1122,9 +1242,7 @@ impl GameStats {
                 // which is exactly what the tracker does on its first save of a
                 // run — the same path, for the same reason. Nothing is credited
                 // by the packet that re-anchors.
-                let switched = *has_experience
-                    && !name.is_empty()
-                    && self.baseline_for.as_deref().is_some_and(|had| had != name);
+                let switched = *has_experience && !name.is_empty() && self.baseline_for.as_deref().is_some_and(|had| had != name);
                 if switched {
                     self.stale_save = true;
                     self.xp_authoritative = false;
@@ -1162,6 +1280,9 @@ impl GameStats {
                     self.total_xp = *experience;
                     self.xp_authoritative = true;
                 }
+                if *has_experience {
+                    self.observe_levels(name, *level, *herolevel);
+                }
                 // The game rebases these statistics itself: after an instance
                 // restart a save can report fewer kills than the one before.
                 // Those monsters were still killed, so a lower total only
@@ -1180,7 +1301,9 @@ impl GameStats {
                 // the same rebase for the bosses and the chests: the first save
                 // to name a counter only sets the mark it is measured from
                 for (key, _, _) in TALLIES {
-                    let Some(&now) = tallies.get(*key) else { continue };
+                    let Some(&now) = tallies.get(*key) else {
+                        continue;
+                    };
                     match self.tally_base.entry(key) {
                         std::collections::hash_map::Entry::Occupied(mut seen) => {
                             let diff = now - seen.get();
@@ -1238,7 +1361,11 @@ impl GameStats {
                     // started, and it read as the non-seasonal one — which is
                     // exactly what a returning player has least of.
                     self.season_mode = Some(if *season > 0 {
-                        if *hardcore == 1 { "GSH" } else { "GSS" }
+                        if *hardcore == 1 {
+                            "GSH"
+                        } else {
+                            "GSS"
+                        }
                     } else if *blood_pact != 0 {
                         "GBP"
                     } else if *hardcore == 1 {
@@ -1451,8 +1578,7 @@ impl GameStats {
                     }
                 }
                 let rarity_key = crate::parser::resolve_rarity(rarity, name, *unscaled);
-                let is_resource =
-                    RESOURCES.iter().any(|(t, _)| t == item_type) || is_container(name);
+                let is_resource = RESOURCES.iter().any(|(t, _)| t == item_type) || is_container(name);
                 // A sighting counts once, whichever of the two got here first:
                 // `counted` is keyed on the item's identity, not on how it was
                 // seen. So a roll on the floor does reach the counters — an
@@ -1512,9 +1638,7 @@ impl GameStats {
                 let listed = self.listed_sound(name);
                 let listed_hit = listed.is_some();
                 let wanted = *announced || listed_hit || self.prefs.prefer_ground || !*ground;
-                let announce = *announced
-                    || listed_hit
-                    || (!is_resource && self.passes_filter(&rarity_key, tier));
+                let announce = *announced || listed_hit || (!is_resource && self.passes_filter(&rarity_key, tier));
                 let flourish = !is_resource && self.worth_a_flourish(&rarity_key, tier, listed_hit);
                 if wanted && (announce || flourish) {
                     // One item, one notification, whichever sighting got here
@@ -1532,10 +1656,7 @@ impl GameStats {
                     // is picked up and says what it is. The local drop and the
                     // pickup that follow stay silent so it chimes once.
                     let lower = name.to_lowercase();
-                    let echo = self
-                        .announced_at
-                        .get(&lower)
-                        .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                    let echo = self.announced_at.get(&lower).is_some_and(|t| t.elapsed() < Duration::from_secs(60));
                     if *announced {
                         self.announced_at.insert(lower, Instant::now());
                         self.announced_at.retain(|_, t| t.elapsed() < Duration::from_secs(120));
@@ -1557,9 +1678,7 @@ impl GameStats {
                     let sound = if echo || !announce {
                         None
                     } else {
-                        listed.or_else(|| {
-                            self.prefs.alerts.contains(&rarity_key).then(|| rarity_key.to_lowercase())
-                        })
+                        listed.or_else(|| self.prefs.alerts.contains(&rarity_key).then(|| rarity_key.to_lowercase()))
                     };
                     let entry = DropEntry {
                         ts_ms: now_ms(),
@@ -1607,9 +1726,7 @@ impl GameStats {
                 // buffs, that is exactly the rotation the player asked to hear
                 // about. The order the server lists them in is its own business,
                 // so they are compared as sets.
-                let rerolled = |s: &SatanicZone| {
-                    s.zone != *zone || !same_set(&s.buffs, buffs) || !same_set(&s.debuffs, debuffs)
-                };
+                let rerolled = |s: &SatanicZone| s.zone != *zone || !same_set(&s.buffs, buffs) || !same_set(&s.debuffs, debuffs);
                 // Only against the zone the same region gave us. A reply for
                 // another region is a different question's answer: it replaces
                 // what we hold, because it is where the player now is, and it
@@ -1667,7 +1784,9 @@ impl GameStats {
         }
         // the save names the purse; before it arrives, an unambiguous packet
         // will do, and the save corrects it if it disagrees
-        let Some(mode) = self.season_mode.or_else(|| c.only_purse()) else { return };
+        let Some(mode) = self.season_mode.or_else(|| c.only_purse()) else {
+            return;
+        };
         let current = c.for_mode(mode);
         if current == 0 {
             return;
@@ -1714,8 +1833,7 @@ impl GameStats {
         // is measured against the abandoned peak, `diff` is always negative,
         // and vendor income, mail and quest gold all register as exactly zero —
         // silently, and persisted into runs.json as a run that earned nothing.
-        self.gold_high =
-            if self.gold_mode == Some(mode) { self.gold_high.max(current) } else { current };
+        self.gold_high = if self.gold_mode == Some(mode) { self.gold_high.max(current) } else { current };
         self.gold_mode = Some(mode);
     }
 
@@ -1768,11 +1886,14 @@ impl GameStats {
             .items
             .iter()
             .map(|(name, c)| {
-                (name.to_string(), ItemStats {
-                    total: c.total,
-                    mf: c.mf,
-                    per_hour: self.per_hour(c.total),
-                })
+                (
+                    name.to_string(),
+                    ItemStats {
+                        total: c.total,
+                        mf: c.mf,
+                        per_hour: self.per_hour(c.total),
+                    },
+                )
             })
             .collect();
         Snapshot {
@@ -1872,6 +1993,18 @@ pub struct Carried {
     pub mode: Option<String>,
     pub xp: i64,
     pub kills: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<CarriedLevel>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CarriedLevel {
+    pub name: String,
+    pub level: i64,
+    pub herolevel: i64,
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Serialize)]
@@ -1968,12 +2101,35 @@ mod tests {
 
     fn tiered_satanic(tier: i64, fingerprint: &str) -> GameEvent {
         match named_item(json!(6), false, "", fingerprint) {
-            GameEvent::ItemAdded { rarity, mf, item_type, item_id, weapon_type, seed, name, announced, amount, fingerprint, ground, .. } => {
-                GameEvent::ItemAdded {
-                    rarity, unscaled: false, mf, tier, item_type, item_id, weapon_type, seed, name,
-                    announced, amount, fingerprint, hash: String::new(), ground,
-                }
-            }
+            GameEvent::ItemAdded {
+                rarity,
+                mf,
+                item_type,
+                item_id,
+                weapon_type,
+                seed,
+                name,
+                announced,
+                amount,
+                fingerprint,
+                ground,
+                ..
+            } => GameEvent::ItemAdded {
+                rarity,
+                unscaled: false,
+                mf,
+                tier,
+                item_type,
+                item_id,
+                weapon_type,
+                seed,
+                name,
+                announced,
+                amount,
+                fingerprint,
+                hash: String::new(),
+                ground,
+            },
             other => other,
         }
     }
@@ -1983,7 +2139,11 @@ mod tests {
     }
 
     fn rolled_zone(zone: &str, buffs: Vec<u8>) -> GameEvent {
-        GameEvent::SatanicZone { zone: zone.into(), buffs, debuffs: vec![4] }
+        GameEvent::SatanicZone {
+            zone: zone.into(),
+            buffs,
+            debuffs: vec![4],
+        }
     }
 
     fn notable_item(name: &str, item_type: i64, amount: i64) -> GameEvent {
@@ -2030,12 +2190,35 @@ mod tests {
 
     fn in_act(act: i64) -> GameEvent {
         match account_xp(1, 0, 0, 1) {
-            GameEvent::Account { experience, has_experience, season, hardcore, blood_pact, name, level, herolevel, difficulty, hell_sub, kills, tallies, .. } => {
-                GameEvent::Account {
-                    experience, act, has_experience, season, hardcore, blood_pact, name, level,
-                    herolevel, difficulty, hell_sub, kills, tallies,
-                }
-            }
+            GameEvent::Account {
+                experience,
+                has_experience,
+                season,
+                hardcore,
+                blood_pact,
+                name,
+                level,
+                herolevel,
+                difficulty,
+                hell_sub,
+                kills,
+                tallies,
+                ..
+            } => GameEvent::Account {
+                experience,
+                act,
+                has_experience,
+                season,
+                hardcore,
+                blood_pact,
+                name,
+                level,
+                herolevel,
+                difficulty,
+                hell_sub,
+                kills,
+                tallies,
+            },
             other => other,
         }
     }
@@ -2067,11 +2250,7 @@ mod tests {
         // and a room that names no act is left alone: nothing contradicts it
         s.apply(&GameEvent::Room("Shadow_Realm_rm".into()));
         s.apply(&in_act(9));
-        assert_eq!(
-            s.snapshot(String::new()).room.as_deref(),
-            Some("Shadow_Realm_rm"),
-            "the Shadow Realm belongs to no act"
-        );
+        assert_eq!(s.snapshot(String::new()).room.as_deref(), Some("Shadow_Realm_rm"), "the Shadow Realm belongs to no act");
     }
 
     fn account_xp(season: i64, hardcore: i64, blood_pact: i64, experience: i64) -> GameEvent {
@@ -2147,7 +2326,7 @@ mod tests {
     fn identity_packets_do_not_override_the_real_season_mode() {
         let mut s = GameStats::default();
         s.apply(&account_xp(CURRENT_SEASON, 0, 0, 5_000)); // full packet: GSS
-        // a later login-identity packet claims season 0 with no experience
+                                                           // a later login-identity packet claims season 0 with no experience
         s.apply(&account(0, 0, 0));
         assert_eq!(s.season_mode, Some("GSS"));
         assert_eq!(s.character.as_ref().unwrap().level, 10);
@@ -2176,7 +2355,11 @@ mod tests {
     fn a_save_does_not_bank_the_same_deposit_again() {
         let mut s = GameStats::default();
         s.apply(&account_packet("x", 0, 0)); // names the purse, calibrates
-        s.apply(&GameEvent::Gold(Currency { gss: 10_000, delta: 2_600, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gss: 10_000,
+            delta: 2_600,
+            ..Default::default()
+        }));
         assert_eq!(s.snapshot(String::new()).gold.earned, 2_600);
 
         // the save replays the last currency packet to re-read the balance now
@@ -2184,14 +2367,14 @@ mod tests {
         for _ in 0..3 {
             s.apply(&account_packet("x", 0, 0));
         }
-        assert_eq!(
-            s.snapshot(String::new()).gold.earned,
-            2_600,
-            "three saves must not turn one deposit into four"
-        );
+        assert_eq!(s.snapshot(String::new()).gold.earned, 2_600, "three saves must not turn one deposit into four");
 
         // and a genuine later deposit is still counted in full
-        s.apply(&GameEvent::Gold(Currency { gss: 12_161, delta: 2_161, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gss: 12_161,
+            delta: 2_161,
+            ..Default::default()
+        }));
         assert_eq!(s.snapshot(String::new()).gold.earned, 4_761);
     }
 
@@ -2426,7 +2609,11 @@ mod tests {
         // a restart mid-session: the carried balance only re-anchors, but the
         // gold banked while the tracker was up is ours
         let mut s = GameStats::default();
-        s.restore(&Carried { gold: 717_188, mode: Some("GSS".into()), xp: 0, kills: 0 });
+        s.restore(&Carried {
+            gold: 717_188,
+            mode: Some("GSS".into()),
+            ..Default::default()
+        });
         s.apply(&account_packet("Parahryushka", 0, 84_833_801));
         for e in parser::events_from_messages(&[json!({"amount_gold": "2600"})]) {
             s.apply(&e);
@@ -2442,7 +2629,13 @@ mod tests {
     #[test]
     fn totals_carried_from_the_last_run_do_not_count_as_earned() {
         let mut s = GameStats::default();
-        s.restore(&Carried { gold: 700_000, mode: Some("GSS".into()), xp: 90_000_000, kills: 912_000 });
+        s.restore(&Carried {
+            gold: 700_000,
+            mode: Some("GSS".into()),
+            xp: 90_000_000,
+            kills: 912_000,
+            ..Default::default()
+        });
         // whatever the game reports first is the new baseline, not a windfall
         s.apply(&account_packet("Parahryushka", 913_000, 91_000_000));
         for e in parser::events_from_messages(&[json!({"currencyData": {"GSS": 715_517}})]) {
@@ -2495,7 +2688,7 @@ mod tests {
             rarity: json!(9),
             unscaled: false,
             mf: false,
-            tier: 6, // SS
+            tier: 6,       // SS
             item_type: 18, // Vial: not a resource, and not gear either
             item_id: 5,
             weapon_type: 0,
@@ -2576,12 +2769,36 @@ mod tests {
 
         // the same item picked up is the same item: it chimed on the way down
         let picked = match drop("AK-47", "a") {
-            GameEvent::ItemAdded { rarity, mf, tier, item_type, item_id, weapon_type, seed, name, announced, amount, fingerprint, hash, .. } => {
-                GameEvent::ItemAdded {
-                    rarity, unscaled: false, mf, tier, item_type, item_id, weapon_type, seed, name,
-                    announced, amount, fingerprint, hash, ground: false,
-                }
-            }
+            GameEvent::ItemAdded {
+                rarity,
+                mf,
+                tier,
+                item_type,
+                item_id,
+                weapon_type,
+                seed,
+                name,
+                announced,
+                amount,
+                fingerprint,
+                hash,
+                ..
+            } => GameEvent::ItemAdded {
+                rarity,
+                unscaled: false,
+                mf,
+                tier,
+                item_type,
+                item_id,
+                weapon_type,
+                seed,
+                name,
+                announced,
+                amount,
+                fingerprint,
+                hash,
+                ground: false,
+            },
             other => other,
         };
         assert!(s.apply(&picked).is_none(), "a list is not told twice about one item");
@@ -2598,7 +2815,11 @@ mod tests {
         // two purses in play and there is nothing to go on — better a blank
         // than the wrong number
         let mut two = GameStats::default();
-        let both = Currency { gss: 100, gns: 200, ..Default::default() };
+        let both = Currency {
+            gss: 100,
+            gns: 200,
+            ..Default::default()
+        };
         two.apply(&GameEvent::Gold(both));
         assert_eq!(two.snapshot(String::new()).gold.total, 0);
 
@@ -2692,23 +2913,40 @@ mod tests {
     #[test]
     fn bosses_and_chests_count_from_the_first_save_on() {
         let save = |satan: i64, odin: i64, ruby: i64| match account_packet("x", 1, 1) {
-            GameEvent::Account { experience, season, hardcore, blood_pact, name, level, herolevel, difficulty, hell_sub, kills, .. } => {
-                GameEvent::Account {
-                    experience, has_experience: true, season, hardcore, blood_pact, name, level,
-                    act: 0,
-                    herolevel, difficulty, hell_sub, kills,
-                    tallies: HashMap::from([
-                        ("statisticsatankills".to_string(), satan),
-                        ("statisticodinkills".to_string(), odin),
-                        ("statisticrubychestsopened".to_string(), ruby),
-                    ]),
-                }
-            }
+            GameEvent::Account {
+                experience,
+                season,
+                hardcore,
+                blood_pact,
+                name,
+                level,
+                herolevel,
+                difficulty,
+                hell_sub,
+                kills,
+                ..
+            } => GameEvent::Account {
+                experience,
+                has_experience: true,
+                season,
+                hardcore,
+                blood_pact,
+                name,
+                level,
+                act: 0,
+                herolevel,
+                difficulty,
+                hell_sub,
+                kills,
+                tallies: HashMap::from([
+                    ("statisticsatankills".to_string(), satan),
+                    ("statisticodinkills".to_string(), odin),
+                    ("statisticrubychestsopened".to_string(), ruby),
+                ]),
+            },
             other => other,
         };
-        let counted = |s: &GameStats, label: &str| {
-            s.tallies().iter().find(|t| t.label == label).map_or(0, |t| t.total)
-        };
+        let counted = |s: &GameStats, label: &str| s.tallies().iter().find(|t| t.label == label).map_or(0, |t| t.total);
 
         let mut s = GameStats::default();
         // the character arrives with a history; none of it belongs to this session
@@ -2917,10 +3155,18 @@ mod tests {
         assert_eq!(s.gold_mode, Some("GBP"), "one funded purse names itself");
 
         s.apply(&account_packet("x", 0, 0));
-        s.apply(&GameEvent::Gold(Currency { gss: 5_000, gbp: 1_706_231, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gss: 5_000,
+            gbp: 1_706_231,
+            ..Default::default()
+        }));
         assert_eq!(s.gold_mode, Some("GSS"), "the save outranks the guess");
 
-        s.apply(&GameEvent::Gold(Currency { gss: 6_000, gbp: 1_706_231, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gss: 6_000,
+            gbp: 1_706_231,
+            ..Default::default()
+        }));
         assert_eq!(s.snapshot(String::new()).gold.earned, 1_000);
     }
 
@@ -3124,7 +3370,12 @@ mod tests {
         s.set_prefer_ground(false);
         let quiet = s.extra_revision();
         s.apply(&GameEvent::Room("Act_07_03".into()));
-        s.apply(&GameEvent::Vitals { mf: Some(120), level: 0, hlevel: 0, satanic_here: Some(false) });
+        s.apply(&GameEvent::Vitals {
+            mf: Some(120),
+            level: 0,
+            hlevel: 0,
+            satanic_here: Some(false),
+        });
         s.apply(&GameEvent::Gold(Currency { gss: 500, ..Default::default() }));
         s.apply(&GameEvent::XpGain(15));
         assert_eq!(s.extra_revision(), quiet, "a heartbeat adds nothing to the journal");
@@ -3145,7 +3396,10 @@ mod tests {
 
     /// A session that has been running for a while, without waiting for one.
     fn aged(secs: u64) -> GameStats {
-        GameStats { start: Instant::now() - Duration::from_secs(secs), ..GameStats::default() }
+        GameStats {
+            start: Instant::now() - Duration::from_secs(secs),
+            ..GameStats::default()
+        }
     }
 
     /// You pause because you are going to town, and going to town is a
@@ -3204,11 +3458,75 @@ mod tests {
         let run = s.finish().expect("a session with earnings is worth keeping");
         assert_eq!(run.kills, 400);
         assert_eq!(run.xp, 50_000);
+        assert_eq!(run.xp_in_level, Some(60_000));
         assert!(run.secs >= 600, "{}", run.secs);
         assert_eq!(run.character.as_deref(), Some("Test"));
         // the room it spent longest in comes first
         assert_eq!(run.zones.first().map(|(room, _)| room.as_str()), Some("Act_07_02"));
         assert!(run.zones[0].1 >= 300, "{:?}", run.zones);
+    }
+
+    #[test]
+    fn completed_hero_levels_keep_their_active_playtime() {
+        let save = |herolevel, experience| GameEvent::Account {
+            experience,
+            act: 0,
+            has_experience: true,
+            season: CURRENT_SEASON,
+            hardcore: 0,
+            blood_pact: 0,
+            name: "Test".into(),
+            level: 100,
+            herolevel,
+            difficulty: 2,
+            hell_sub: 0,
+            kills: 1,
+            tallies: HashMap::new(),
+        };
+        let mut s = aged(600);
+        s.apply(&save(10, 20_236));
+
+        // The first observed level began before the tracker saw it, so its
+        // measured remainder is explicitly partial.
+        let now = s.active().as_secs();
+        s.level_mark.as_mut().unwrap().since_secs = now - 95;
+        s.apply(&save(11, 30_236));
+
+        // Once a boundary has been observed, the next timer is a full one.
+        let now = s.active().as_secs();
+        s.level_mark.as_mut().unwrap().since_secs = now - 140;
+        s.apply(&save(12, 40_236));
+
+        let run = s.finish().expect("the level gains earned XP and make a run");
+        assert_eq!(run.level_splits.len(), 2);
+        assert!(run.level_splits[0].hero);
+        assert_eq!((run.level_splits[0].from_level, run.level_splits[0].to_level), (10, 11));
+        assert_eq!(run.level_splits[0].secs, 95);
+        assert!(run.level_splits[0].partial);
+        assert_eq!((run.level_splits[1].from_level, run.level_splits[1].to_level), (11, 12));
+        assert_eq!(run.level_splits[1].secs, 140);
+        assert!(!run.level_splits[1].partial);
+    }
+
+    #[test]
+    fn an_ongoing_level_timer_survives_run_resets_and_restart_state() {
+        let mut s = aged(300);
+        s.observe_levels("Test", 100, 10);
+        let now = s.active().as_secs();
+        s.level_mark.as_mut().unwrap().since_secs = now - 70;
+        s.reset();
+        assert_eq!(s.level_mark.as_ref().unwrap().accumulated_secs, 70);
+
+        let carried_json = serde_json::to_string(&s.carried()).unwrap();
+        let carried: Carried = serde_json::from_str(&carried_json).unwrap();
+        let mut resumed = GameStats::default();
+        resumed.restore(&carried);
+        resumed.start = Instant::now() - Duration::from_secs(30);
+        resumed.observe_levels("Test", 100, 11);
+
+        assert_eq!(resumed.level_splits.len(), 1);
+        assert_eq!(resumed.level_splits[0].secs, 100);
+        assert!(resumed.level_splits[0].partial);
     }
 
     #[test]
@@ -3293,10 +3611,7 @@ mod tests {
         s.prefs.min_tier = 3;
 
         assert!(s.apply(&sighting(true, 0, "a")).is_none(), "no grade on the floor, no alert");
-        assert!(
-            s.apply(&sighting(false, 5, "a")).is_some(),
-            "the bag proves the grade, and the roll never reached `told`"
-        );
+        assert!(s.apply(&sighting(false, 5, "a")).is_some(), "the bag proves the grade, and the roll never reached `told`");
 
         // Most pickups have no roll this app saw at all. They are announced.
         let mut t = GameStats::default();
@@ -3353,9 +3668,16 @@ mod tests {
 
     #[test]
     fn climbing_back_to_a_balance_the_bank_has_held_is_not_income() {
-        let balance = |gns: i64| GameEvent::Gold(crate::parser::Currency {
-            gss: 0, gsh: 0, gns, gnh: 0, gbp: 0, delta: 0,
-        });
+        let balance = |gns: i64| {
+            GameEvent::Gold(crate::parser::Currency {
+                gss: 0,
+                gsh: 0,
+                gns,
+                gnh: 0,
+                gbp: 0,
+                delta: 0,
+            })
+        };
         let mut s = GameStats::default();
         s.apply(&account(0, 0, 0));
         s.apply(&balance(78_101)); // the run starts on the main's purse
@@ -3376,12 +3698,26 @@ mod tests {
     fn a_deposit_and_the_balance_that_answers_it_are_one_lot_of_coins() {
         // The client says it banked ten thousand and the server says the bank
         // now holds ten thousand more. Both orders, same answer.
-        let deposit = |amount: i64| GameEvent::Gold(crate::parser::Currency {
-            gss: 0, gsh: 0, gns: 0, gnh: 0, gbp: 0, delta: amount,
-        });
-        let balance = |gns: i64| GameEvent::Gold(crate::parser::Currency {
-            gss: 0, gsh: 0, gns, gnh: 0, gbp: 0, delta: 0,
-        });
+        let deposit = |amount: i64| {
+            GameEvent::Gold(crate::parser::Currency {
+                gss: 0,
+                gsh: 0,
+                gns: 0,
+                gnh: 0,
+                gbp: 0,
+                delta: amount,
+            })
+        };
+        let balance = |gns: i64| {
+            GameEvent::Gold(crate::parser::Currency {
+                gss: 0,
+                gsh: 0,
+                gns,
+                gnh: 0,
+                gbp: 0,
+                delta: 0,
+            })
+        };
 
         for order in ["deposit first", "balance first"] {
             let mut s = GameStats::default();
@@ -3394,11 +3730,7 @@ mod tests {
                 s.apply(&balance(110_000));
                 s.apply(&deposit(10_000));
             }
-            assert_eq!(
-                s.snapshot(String::new()).gold.earned,
-                10_000,
-                "{order}: the same ten thousand, counted once"
-            );
+            assert_eq!(s.snapshot(String::new()).gold.earned, 10_000, "{order}: the same ten thousand, counted once");
         }
     }
 
