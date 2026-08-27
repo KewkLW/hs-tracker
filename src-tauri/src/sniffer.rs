@@ -1,9 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -292,7 +292,7 @@ fn unmap(ip: IpAddr) -> IpAddr {
 /// The near ends were collected too and are not any more: see `scope_for` for
 /// why naming this machine's own address in the filter did more harm than the
 /// narrowing was worth.
-fn game_sockets(pids: &[u32]) -> BTreeSet<(IpAddr, u16)> {
+fn game_endpoints(pids: &[u32]) -> BTreeSet<IpAddr> {
     let mut remote = BTreeSet::new();
     if pids.is_empty() {
         return remote;
@@ -308,15 +308,11 @@ fn game_sockets(pids: &[u32]) -> BTreeSet<(IpAddr, u16)> {
                 if far.is_unspecified() || far.is_loopback() {
                     continue;
                 }
-                remote.insert((far, t.remote_port));
+                remote.insert(far);
             }
         }
     }
     remote
-}
-
-fn endpoint_addresses(sockets: &BTreeSet<(IpAddr, u16)>) -> BTreeSet<IpAddr> {
-    sockets.iter().map(|(address, _)| *address).collect()
 }
 
 /// Every adapter worth listening on. A split-tunnel engine (WireSock and the
@@ -563,35 +559,6 @@ fn scope_for(remote: &BTreeSet<IpAddr>) -> String {
     out.join(" or ")
 }
 
-/// Market research is privacy-sensitive, so it never inherits the tracker's
-/// broad `/24` or all-TCP fallback. These address/port pairs come directly from
-/// sockets owned by the Hero Siege PID. A new ephemeral local port still
-/// matches the already-attributed remote endpoint.
-fn market_scope_for(remote: &BTreeSet<(IpAddr, u16)>) -> String {
-    if remote.is_empty() {
-        return "port 0".into();
-    }
-    remote.iter().map(|(address, port)| format!("(host {address} and port {port})")).collect::<Vec<_>>().join(" or ")
-}
-
-fn resolve_market_endpoints(raw: &str) -> BTreeSet<(IpAddr, u16)> {
-    let mut endpoints = BTreeSet::new();
-    for value in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-        if let Ok(addresses) = value.to_socket_addrs() {
-            endpoints.extend(addresses.map(|address| (address.ip(), address.port())));
-        }
-    }
-    endpoints
-}
-
-/// Optional endpoint(s) learned during the metadata phase. This closes the
-/// race where a short-lived Search socket opens and closes between process
-/// socket sweeps without broadening observer mode to all TCP.
-fn configured_market_endpoints() -> &'static BTreeSet<(IpAddr, u16)> {
-    static ENDPOINTS: OnceLock<BTreeSet<(IpAddr, u16)>> = OnceLock::new();
-    ENDPOINTS.get_or_init(|| std::env::var("HS_MARKET_ENDPOINTS").map(|value| resolve_market_endpoints(&value)).unwrap_or_default())
-}
-
 pub fn spawn(shared: &Shared, app: tauri::AppHandle) {
     let stats = shared.stats.clone();
     let status = shared.status.clone();
@@ -706,20 +673,11 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         // inode-to-pid map — four calls in five were thrown away.
         if running && looked.elapsed() >= Duration::from_secs(5) {
             looked = std::time::Instant::now();
-            let sockets = game_sockets(&pids);
-            let remote = endpoint_addresses(&sockets);
+            let remote = game_endpoints(&pids);
             hosts = remote.len();
             wanted = capture_devices();
             let narrow = scope_for(&remote);
-            let next = if crate::market_observer_enabled() {
-                let mut observer_endpoints = sockets.clone();
-                observer_endpoints.extend(configured_market_endpoints().iter().copied());
-                market_scope_for(&observer_endpoints)
-            } else if wide_capture() {
-                "tcp".to_string()
-            } else {
-                narrow
-            };
+            let next = if wide_capture() { "tcp".to_string() } else { narrow };
             if next != scope {
                 crate::log::say("net", &format!("capture filter: {next}"));
                 scope = next;
@@ -917,7 +875,6 @@ fn capture_loop(
     opened: Arc<AtomicBool>,
     app: &tauri::AppHandle,
 ) -> Result<(), pcap::Error> {
-    let adapter = dev.name.clone();
     let mut cap = pcap::Capture::from_device(dev)?.immediate_mode(true).timeout(400).open()?;
     cap.filter(&format!("tcp and len > 30 and ({scope})"), true)?;
     // past every way this can fail: only now is it a capture
@@ -929,16 +886,7 @@ fn capture_loop(
     let mut asm = Reassembler::default();
     let mut swept = std::time::Instant::now();
     let mut counted = std::time::Instant::now();
-    let market_observer = crate::market_observer_enabled();
-    let mut port_443_windows: HashMap<parser::Flow, crate::market::Port443Summary> = HashMap::new();
-    let mut port_443_swept = std::time::Instant::now();
-
     while !stop.load(Ordering::Relaxed) {
-        if market_observer && port_443_swept.elapsed() >= Duration::from_secs(1) {
-            crate::market_port_443_observation_log(&port_443_windows, &adapter);
-            port_443_windows.clear();
-            port_443_swept = std::time::Instant::now();
-        }
         if counted.elapsed() >= Duration::from_secs(15) {
             counted = std::time::Instant::now();
             if let Ok(st) = cap.stats() {
@@ -962,8 +910,8 @@ fn capture_loop(
         };
         if packet.is_none() || swept.elapsed() >= Duration::from_millis(100) {
             swept = std::time::Instant::now();
-            for (flow, flushed) in asm.drain_idle() {
-                handle_flush(&flushed, flow, &stats, &hits, app, &adapter);
+            for (src, flushed) in asm.drain_idle() {
+                handle_flush(&flushed, src, &stats, &hits, app);
             }
         }
         let Some((data, whole)) = packet else {
@@ -994,7 +942,6 @@ fn capture_loop(
         let Some(TransportSlice::Tcp(tcp)) = &pkt.transport else {
             continue;
         };
-        let flow = (src, tcp.source_port(), tcp.destination_port());
         // The filter is deliberately wide (everything this machine sends and
         // receives), so TLS is skipped here: an encrypted stream cannot yield
         // the plaintext the parser looks for, and reassembling it is pure cost.
@@ -1006,28 +953,15 @@ fn capture_loop(
         // payloads that never match, which the scan budget already bounds.
         if tcp.source_port() == 443 || tcp.destination_port() == 443 {
             tls.fetch_add(1, Ordering::Relaxed);
-            if market_observer {
-                let summary = port_443_windows.entry(flow).or_default();
-                summary.packet_count = summary.packet_count.saturating_add(1);
-                summary.payload_bytes = summary.payload_bytes.saturating_add(tcp.payload().len() as u64);
-                if crate::market::looks_like_tls_record(tcp.payload()) {
-                    summary.tls_like_packet_count = summary.tls_like_packet_count.saturating_add(1);
-                }
-            }
-            // Observer mode still feeds 443 through the bounded parser. A port
-            // number is not proof of encryption: route optimizers can relay the
-            // ordinary plaintext protocol there. Raw bytes are never logged.
-            if !wide_capture() && !market_observer {
+            if !wide_capture() {
                 continue;
             }
         }
 
+        let flow = (src, tcp.source_port(), tcp.destination_port());
         if let Some(flushed) = asm.push(flow, tcp.acknowledgment_number(), tcp.payload()) {
-            handle_flush(&flushed, flow, &stats, &hits, app, &adapter);
+            handle_flush(&flushed, src, &stats, &hits, app);
         }
-    }
-    if market_observer {
-        crate::market_port_443_observation_log(&port_443_windows, &adapter);
     }
     Ok(())
 }
@@ -1058,14 +992,12 @@ fn fresh_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn handle_flush(flushed: &[u8], flow: parser::Flow, stats: &Arc<Mutex<GameStats>>, hits: &Arc<AtomicU32>, app: &tauri::AppHandle, adapter: &str) {
-    let src = flow.0;
+fn handle_flush(flushed: &[u8], src: IpAddr, stats: &Arc<Mutex<GameStats>>, hits: &Arc<AtomicU32>, app: &tauri::AppHandle) {
     let messages = fresh_messages(parser::extract_messages(flushed));
     if messages.is_empty() {
         return;
     }
     hits.fetch_add(1, Ordering::Relaxed);
-    crate::market_observation_log(&messages, flow, adapter);
     crate::debug_log(&messages, src);
     let events = parser::events_from_messages(&messages);
     crate::dev_log(&events, src);
@@ -1163,28 +1095,6 @@ mod tests {
     #[test]
     fn the_filter_is_wide_until_the_game_names_itself() {
         assert_eq!(scope_for(&BTreeSet::new()), "tcp");
-    }
-
-    #[test]
-    fn market_observer_scope_is_empty_until_the_game_names_an_exact_endpoint() {
-        assert_eq!(market_scope_for(&BTreeSet::new()), "port 0");
-        let endpoints = [("192.0.2.10".parse::<IpAddr>().unwrap(), 443), ("198.51.100.20".parse::<IpAddr>().unwrap(), 6600)]
-            .into_iter()
-            .collect();
-        let filter = market_scope_for(&endpoints);
-        assert!(filter.contains("host 192.0.2.10 and port 443"));
-        assert!(filter.contains("host 198.51.100.20 and port 6600"));
-        assert!(!filter.contains("/24"));
-    }
-
-    #[test]
-    fn configured_market_endpoints_are_explicit_and_bounded() {
-        let endpoints = resolve_market_endpoints("192.0.2.10:443,198.51.100.20:6600");
-        assert_eq!(endpoints.len(), 2);
-        let filter = market_scope_for(&endpoints);
-        assert!(filter.contains("host 192.0.2.10 and port 443"));
-        assert!(filter.contains("host 198.51.100.20 and port 6600"));
-        assert!(!filter.contains("tcp"));
     }
 
     /// And once it does, the filter names the far end only.

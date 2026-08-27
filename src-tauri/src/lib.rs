@@ -1,6 +1,5 @@
 mod items;
 mod log;
-mod market;
 mod parser;
 mod presence;
 mod sniffer;
@@ -602,9 +601,7 @@ fn relaunch(x11: bool) -> Result<(), String> {
 /// replayed against the parser when counters look wrong.
 pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
     use std::io::Write;
-    // Fail closed: sanitized market research and the credential-bearing raw
-    // debug log may never run together, even if Debug Log was persisted on.
-    if market_observer_enabled() || !DEBUG_LOG.load(Ordering::Relaxed) {
+    if !DEBUG_LOG.load(Ordering::Relaxed) {
         return;
     }
     // The file stays open: with the wide capture this runs many times a second.
@@ -653,30 +650,6 @@ pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
         }
     }
     let _ = f.flush();
-}
-
-/// A deliberately narrower protocol log for market research. Unlike the raw
-/// debug capture this never writes packet bodies or field values that can
-/// authenticate the account. It is opt-in through an environment variable so
-/// ordinary tracker users do not create another runtime file.
-pub(crate) fn market_observation_log(messages: &[serde_json::Value], flow: parser::Flow, adapter: &str) {
-    if !market_observer_enabled() {
-        return;
-    }
-    let _ = market::append_observations(&data_dir().join("market-observations.jsonl"), messages, flow, adapter);
-}
-
-pub(crate) fn market_observer_enabled() -> bool {
-    std::env::var("HS_MARKET_OBSERVER")
-        .ok()
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-}
-
-pub(crate) fn market_port_443_observation_log(windows: &std::collections::HashMap<parser::Flow, market::Port443Summary>, adapter: &str) {
-    if !market_observer_enabled() {
-        return;
-    }
-    let _ = market::append_port_443_windows(&data_dir().join("market-observations.jsonl"), windows, adapter);
 }
 
 /// `npm start` builds: every parsed event goes to the terminal. DevTools stay

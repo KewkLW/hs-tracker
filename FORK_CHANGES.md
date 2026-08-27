@@ -41,21 +41,6 @@ Settings can choose the monitor and initial face used on the next launch:
 Automatic game detection no longer opens a compact overlay beside an already
 visible dashboard.
 
-## Passive market-observer groundwork
-
-`HS_MARKET_OBSERVER=1` enables a disabled-by-default protocol research mode. It
-does not provide a market API or price checker yet. It sends no requests, reads
-no game memory, performs no injection, replay, MITM, or certificate bypass, and
-records no raw packet payloads or credential values.
-
-The observer restricts capture to exact Hero Siege endpoint tuples (plus any
-explicit `HS_MARKET_ENDPOINTS`), suppresses the raw Debug Log, redacts dynamic
-routes and sensitive fields, and stores only structural observations and
-one-second TLS-framing summaries. Flow and adapter identities are process-salted
-opaque tags rather than raw addresses, ports, or device GUIDs. The log rotates
-at 16 MB and retains one older segment. See [MARKET_OBSERVER.md](MARKET_OBSERVER.md)
-for the experiment and its limits.
-
 ## Validation
 
 - `npm test` — JavaScript and Rust suites

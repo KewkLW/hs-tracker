@@ -221,7 +221,7 @@ impl Reassembler {
 
     /// Buffers nobody has added to for a moment, so a stream that only talks
     /// one way still gets read.
-    pub fn drain_idle(&mut self) -> Vec<(Flow, Vec<u8>)> {
+    pub fn drain_idle(&mut self) -> Vec<(IpAddr, Vec<u8>)> {
         let now = Instant::now();
         let ripe: Vec<(Flow, u32)> = self
             .bufs
@@ -232,7 +232,7 @@ impl Reassembler {
         ripe.into_iter()
             .filter_map(|key| {
                 let pending = self.bufs.remove(&key)?;
-                Some((key.0, self.finish(key.0, pending.data)))
+                Some((key.0 .0, self.finish(key.0, pending.data)))
             })
             .collect()
     }
@@ -495,24 +495,12 @@ fn query_payload(s: &str) -> Option<Value> {
     if !s.contains('=') || !s.contains('&') {
         return None;
     }
-    // start at the first printable route/key, so protocol noise ahead of it is dropped
+    // start at the first key=, so protocol noise ahead of it is dropped
     let start = s.find(|c: char| c.is_ascii_alphanumeric() || c == '_')?;
-    let candidate = &s[start..];
-    // Some requests put the route before the ordinary form body:
-    // `market/foo?account_id=...&checksum=...`. Keep only the path, never the
-    // query values, so the market observer can classify the message without
-    // mistaking `market/foo?account_id` for a field name.
-    let (route, query) = match candidate.split_once('?') {
-        Some((route, query)) if route.contains('/') && query.contains('=') => (Some(route.trim_matches('/')), query),
-        _ => (None, candidate),
-    };
-    let mut map: serde_json::Map<String, Value> = form_urlencoded::parse(query.as_bytes())
+    let map: serde_json::Map<String, Value> = form_urlencoded::parse(&s.as_bytes()[start..])
         .filter(|(k, _)| !k.is_empty())
         .map(|(k, v)| (k.into_owned(), parse_query_value(v.into_owned())))
         .collect();
-    if let Some(route) = route.filter(|route| !route.is_empty() && route.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))) {
-        map.insert("__route".into(), Value::String(route.to_string()));
-    }
     (!map.is_empty()).then_some(Value::Object(map))
 }
 
@@ -877,7 +865,7 @@ fn is_inventory_item_data(d: &Value, item_data: &Value) -> bool {
     if has(item_data, PICKUP_FIELDS) {
         return true;
     }
-    let route = match field(d, &["route", "__route"]) {
+    let route = match field(d, &["route"]) {
         Some(Value::String(s)) => s,
         _ => String::new(),
     };
@@ -2214,16 +2202,6 @@ mod tests {
         let messages = extract_messages(raw);
         let events = events_from_messages(&messages);
         assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 727015)), "no gold in {messages:?}");
-    }
-
-    #[test]
-    fn a_market_query_keeps_its_route_separate_from_secret_fields() {
-        let raw = b"\x01market/market_player_get_items_on_sale?account_id=5&identifier=secret&checksum=ab\x00";
-        let messages = extract_messages(raw);
-        let object = messages.iter().find_map(Value::as_object).expect("the form message was parsed");
-        assert_eq!(object.get("__route").and_then(Value::as_str), Some("market/market_player_get_items_on_sale"));
-        assert_eq!(object.get("account_id").and_then(Value::as_str), Some("5"));
-        assert!(!object.contains_key("market/market_player_get_items_on_sale?account_id"));
     }
 
     #[test]
