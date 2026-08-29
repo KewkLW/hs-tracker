@@ -18,8 +18,28 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 /// Tauri puts this on the window before any of our code runs.
 export const native = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
+// Settings editors are separate tab components, but they all send the complete
+// Settings object. Serializing writes in this webview prevents a tab's final
+// debounced snapshot from overtaking the next tab's save. A fresh reader waits
+// for that queue too, so it never hydrates from the state just before a pending
+// write. Individual components still merge settings-changed events so edits
+// made while a write is in flight are preserved.
+let settingsWrite = Promise.resolve();
+
 export async function invoke(command, args) {
   if (!native) return null;
+  if (command === 'save_settings') {
+    const running = settingsWrite
+      .catch(() => {})
+      .then(() => tauriInvoke(command, args));
+    settingsWrite = running;
+    return running;
+  }
+  if (command === 'get_settings') {
+    return settingsWrite
+      .catch(() => {})
+      .then(() => tauriInvoke(command, args));
+  }
   return tauriInvoke(command, args);
 }
 

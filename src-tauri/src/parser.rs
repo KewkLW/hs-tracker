@@ -5,6 +5,19 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::Value;
 
+/// Exact item-stat values carried by an inventory addition.
+///
+/// Named items carry only the rolled values; generated bases additionally
+/// carry one descriptor per affix as `[stat id, min, max, tier]`. Keeping the
+/// two forms separate lets alert rules use only actual values without retaining
+/// the whole packet (or mistaking a descriptor or `rarity`/`tier` metadata for
+/// a value).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ItemRolls {
+    pub values: Vec<(u16, f64)>,
+    pub ranges: Vec<(u16, f64, f64)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Currency {
     pub gss: i64,
@@ -28,7 +41,13 @@ impl Currency {
     /// none, and that is a mistake this app has made before.
     pub fn only_purse(&self) -> Option<&'static str> {
         let mut found = None;
-        for (name, value) in [("GSS", self.gss), ("GSH", self.gsh), ("GNS", self.gns), ("GNH", self.gnh), ("GBP", self.gbp)] {
+        for (name, value) in [
+            ("GSS", self.gss),
+            ("GSH", self.gsh),
+            ("GNS", self.gns),
+            ("GNH", self.gnh),
+            ("GBP", self.gbp),
+        ] {
             if value > 0 {
                 if found.is_some() {
                     return None;
@@ -144,6 +163,9 @@ pub enum GameEvent {
         hash: String,
         /// generated on the ground (the moment it drops), not picked up
         ground: bool,
+        /// Exact values appear when the item enters the inventory. Ground
+        /// packets carry no values, so this is empty for the first sighting.
+        rolls: ItemRolls,
     },
     SatanicZone {
         zone: String,
@@ -206,7 +228,10 @@ impl Reassembler {
         }
         self.evict_stale();
         let last = *self.last_ack.entry(flow).or_insert(ack);
-        let buf = self.bufs.entry((flow, ack)).or_insert_with(|| Pending { data: Vec::new(), at: Instant::now() });
+        let buf = self.bufs.entry((flow, ack)).or_insert_with(|| Pending {
+            data: Vec::new(),
+            at: Instant::now(),
+        });
         if buf.data.len() < BUF_CAP {
             buf.data.extend_from_slice(payload);
         }
@@ -298,7 +323,8 @@ impl Reassembler {
         self.bufs.retain(|_, b| now.duration_since(b.at) < BUF_TTL);
         // capturing every host this machine talks to means flows come and go;
         // their ack and carry entries go with them
-        let live: std::collections::HashSet<Flow> = self.bufs.keys().map(|(flow, _)| *flow).collect();
+        let live: std::collections::HashSet<Flow> =
+            self.bufs.keys().map(|(flow, _)| *flow).collect();
         self.last_ack.retain(|flow, _| live.contains(flow));
         self.carry.retain(|flow, _| live.contains(flow));
         if self.bufs.len() > 512 {
@@ -333,7 +359,10 @@ fn opens_a_value(tail: &[u8]) -> bool {
     };
     match opener {
         b'{' => next == b'"' || next == b'}',
-        b'[' => matches!(next, b'"' | b'{' | b'[' | b']' | b'-' | b't' | b'f' | b'n' | b'0'..=b'9'),
+        b'[' => matches!(
+            next,
+            b'"' | b'{' | b'[' | b']' | b'-' | b't' | b'f' | b'n' | b'0'..=b'9'
+        ),
         _ => false,
     }
 }
@@ -360,8 +389,12 @@ fn unterminated_start(buf: &[u8]) -> usize {
 /// key of every packet, several times per packet).
 fn norm_eq(a: &str, b: &str) -> bool {
     let (mut ai, mut bi) = (
-        a.bytes().filter(u8::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()),
-        b.bytes().filter(u8::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()),
+        a.bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase()),
+        b.bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase()),
     );
     loop {
         match (ai.next(), bi.next()) {
@@ -394,7 +427,9 @@ fn field_ref<'a>(obj: &'a Value, names: &[&str]) -> Option<&'a Value> {
             return Some(v);
         }
     }
-    map.iter().find(|(k, _)| names.iter().any(|n| norm_eq(n, k))).map(|(_, v)| v)
+    map.iter()
+        .find(|(k, _)| names.iter().any(|n| norm_eq(n, k)))
+        .map(|(_, v)| v)
 }
 
 /// Normalized field lookup; string values that hold JSON are re-parsed.
@@ -413,7 +448,9 @@ pub fn as_int(v: &Value) -> Option<i64> {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
         Value::String(s) => {
             let t = s.trim();
-            t.parse::<i64>().ok().or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+            t.parse::<i64>()
+                .ok()
+                .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
         }
         _ => None,
     }
@@ -435,7 +472,11 @@ fn tallies(obj: &Value) -> HashMap<String, i64> {
         return out;
     };
     for (key, value) in map {
-        let flat: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        let flat: String = key
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
         if flat.len() > "statistic".len() && flat.starts_with("statistic") {
             if let Some(n) = as_int(value) {
                 out.insert(flat, n);
@@ -528,7 +569,10 @@ fn parse_query_value(v: String) -> Value {
 fn extract_json_values(bytes: &[u8]) -> Vec<Value> {
     let mut out = Vec::new();
     let mut i = 0;
-    let mut budget = bytes.len().saturating_mul(SCAN_BUDGET).saturating_add(MAX_SPAN);
+    let mut budget = bytes
+        .len()
+        .saturating_mul(SCAN_BUDGET)
+        .saturating_add(MAX_SPAN);
     while i < bytes.len() {
         let c = bytes[i];
         if c == b'{' || c == b'[' {
@@ -540,7 +584,9 @@ fn extract_json_values(bytes: &[u8]) -> Vec<Value> {
             budget = budget.saturating_sub(walked);
             if let Some(end) = end {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes[i..=end]) {
-                    let excluded = v.as_object().is_some_and(|o| o.contains_key("inventory_charms") || o.contains_key("steam"));
+                    let excluded = v.as_object().is_some_and(|o| {
+                        o.contains_key("inventory_charms") || o.contains_key("steam")
+                    });
                     if !excluded {
                         out.push(v);
                     }
@@ -642,7 +688,9 @@ fn as_bool(v: Option<&Value>) -> bool {
 }
 
 fn b64_json(s: &str) -> Option<Value> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(s.trim().as_bytes()).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.trim().as_bytes())
+        .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -667,7 +715,12 @@ fn walk_dicts(v: &Value, events: &mut Vec<GameEvent>) {
 }
 
 const GOLD_FIELDS: &[&str] = &["currencyData", "currency_data"];
-const XP_TOTAL_FIELDS: &[&str] = &["totalGuildXp", "total_guild_xp", "totalGuildExp", "total_guild_exp"];
+const XP_TOTAL_FIELDS: &[&str] = &[
+    "totalGuildXp",
+    "total_guild_xp",
+    "totalGuildExp",
+    "total_guild_exp",
+];
 const XP_GAIN_FIELDS: &[&str] = &["xp", "experienceGained", "experience_gained"];
 const MAIL_FIELDS: &[&str] = &["newMail", "new_mail", "mail"];
 const ITEM_WRAPPER_FIELDS: &[&str] = &["addedItemObject", "added_item_object"];
@@ -675,9 +728,21 @@ const ITEM_SIGNATURE_FIELDS: &[&str] = &["seed", "a", "itemId", "item_id", "gid"
 const ITEM_NAMED_SIGNATURE_FIELDS: &[&str] = &["seed", "itemId", "item_id", "gid"];
 const ITEM_RARITY_FIELDS: &[&str] = &["rarity", "itemRarity", "item_rarity", "d"];
 const SATANIC_ZONE_FIELDS: &[&str] = &["satanicZoneName", "satanic_zone_name"];
-const REGION_ID_FIELDS: &[&str] = &["crossregion_identifier", "crossRegionIdentifier", "cross_region_identifier"];
+const REGION_ID_FIELDS: &[&str] = &[
+    "crossregion_identifier",
+    "crossRegionIdentifier",
+    "cross_region_identifier",
+];
 const ACCOUNT_ID_FIELDS: &[&str] = &["unique_account_id", "uniqueAccountId"];
-const ACCOUNT_SIGNATURE_FIELDS: &[&str] = &["name", "class", "class_id", "heroLevel", "herolevel", "season", "hardcore"];
+const ACCOUNT_SIGNATURE_FIELDS: &[&str] = &[
+    "name",
+    "class",
+    "class_id",
+    "heroLevel",
+    "herolevel",
+    "season",
+    "hardcore",
+];
 
 /// One packet can carry several things at once (currency + items + zone), so
 /// every matching rule contributes; matching only the first loses events.
@@ -782,8 +847,25 @@ fn dict_to_events(d: &Value) -> Vec<GameEvent> {
     let identity_account = !full_account
         && has(d, &["name"])
         && has(d, &["accountUID", "accountUid", "unique_id", "uniqueId"])
-        && has(d, &["cross_region_identifier", "crossRegionIdentifier", "cross_region_id", "crossRegionId"])
-        && !has(d, &["platformUserName", "platform_user_name", "nameColor", "name_color", "slot"]);
+        && has(
+            d,
+            &[
+                "cross_region_identifier",
+                "crossRegionIdentifier",
+                "cross_region_id",
+                "crossRegionId",
+            ],
+        )
+        && !has(
+            d,
+            &[
+                "platformUserName",
+                "platform_user_name",
+                "nameColor",
+                "name_color",
+                "slot",
+            ],
+        );
     if (full_account || identity_account) && has(d, &["season"]) && has(d, &["hardcore"]) {
         let name = match field(d, &["name"]) {
             Some(Value::String(s)) => s,
@@ -801,7 +883,15 @@ fn dict_to_events(d: &Value) -> Vec<GameEvent> {
             difficulty: int_field(d, &["difficulty"]),
             hell_sub: int_field(d, &["hell_subdifficulty", "hellSubdifficulty"]),
             act: act_of(d),
-            kills: int_field(d, &["statisticTotalMonsterKills", "statistic_total_monster_kills", "totalMonsterKills", "total_monster_kills"]),
+            kills: int_field(
+                d,
+                &[
+                    "statisticTotalMonsterKills",
+                    "statistic_total_monster_kills",
+                    "totalMonsterKills",
+                    "total_monster_kills",
+                ],
+            ),
             tallies: tallies(d),
         });
     // The guild share of somebody else's experience, and the one event here
@@ -820,20 +910,31 @@ fn dict_to_events(d: &Value) -> Vec<GameEvent> {
     // So this one is held to the same standard as the item path: it has to
     // arrive in something shaped like a game message. Every one of them carries
     // a `status` or a `message`; the junk packet carried two fields and neither.
-    } else if !full_account && !identity_account && (has(d, &["status"]) || !msg_text(d).is_empty()) && has(d, XP_GAIN_FIELDS) && !has(d, XP_TOTAL_FIELDS) {
+    } else if !full_account
+        && !identity_account
+        && (has(d, &["status"]) || !msg_text(d).is_empty())
+        && has(d, XP_GAIN_FIELDS)
+        && !has(d, XP_TOTAL_FIELDS)
+    {
         events.push(GameEvent::XpGain(xp_gain(d)));
     }
     events
 }
 
 fn has_currency_totals(d: &Value) -> bool {
-    ["GSS", "GSH", "GNS", "GNH", "GBP"].iter().any(|f| has(d, &[f]))
+    ["GSS", "GSH", "GNS", "GNH", "GBP"]
+        .iter()
+        .any(|f| has(d, &[f]))
 }
 
 /// XP gain is the first number in the message text, else the xp field.
 fn xp_gain(d: &Value) -> i64 {
     let msg = msg_text(d);
-    let digits: String = msg.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = msg
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if let Ok(n) = digits.parse() {
         return n;
     }
@@ -846,8 +947,15 @@ fn xp_gain(d: &Value) -> i64 {
 const RESOURCE_TYPES: [i64; 4] = [12, 13, 14, 15];
 
 /// What only a market message carries. See `item_sources`.
-const MARKET_FIELDS: &[&str] =
-    &["marketId", "market_id", "market_tokens", "marketTokens", "seller_name", "sellerName", "price"];
+const MARKET_FIELDS: &[&str] = &[
+    "marketId",
+    "market_id",
+    "market_tokens",
+    "marketTokens",
+    "seller_name",
+    "sellerName",
+    "price",
+];
 
 const ITEM_DATA_FIELDS: &[&str] = &["itemData", "item_data"];
 const PICKUP_FIELDS: &[&str] = &["pickup_add_data", "pickupAddData"];
@@ -875,7 +983,11 @@ fn is_inventory_item_data(d: &Value, item_data: &Value) -> bool {
 
 fn object_items(v: &Value) -> Vec<(Option<String>, Value)> {
     match v {
-        Value::Object(map) => map.iter().filter(|(_, v)| v.is_object()).map(|(fp, item)| (Some(fp.clone()), item.clone())).collect(),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(_, v)| v.is_object())
+            .map(|(fp, item)| (Some(fp.clone()), item.clone()))
+            .collect(),
         _ => vec![],
     }
 }
@@ -906,20 +1018,34 @@ fn item_sources(d: &Value) -> Vec<(Option<String>, Value, bool)> {
     if MARKET_FIELDS.iter().any(|f| has(d, &[f])) {
         return vec![];
     }
-    let own_fp = match field(d, &["addedItemFingerprint", "added_item_fingerprint", "fingerprint"]) {
+    let own_fp = match field(
+        d,
+        &[
+            "addedItemFingerprint",
+            "added_item_fingerprint",
+            "fingerprint",
+        ],
+    ) {
         Some(Value::String(s)) if !s.is_empty() => Some(s),
         _ => None,
     };
     let ops = field(d, &["operations"]).unwrap_or(Value::Null);
 
-    let pickups = |v: Vec<(Option<String>, Value)>| -> Vec<(Option<String>, Value, bool)> { v.into_iter().map(|(fp, item)| (fp, item, false)).collect() };
+    let pickups = |v: Vec<(Option<String>, Value)>| -> Vec<(Option<String>, Value, bool)> {
+        v.into_iter().map(|(fp, item)| (fp, item, false)).collect()
+    };
 
     if let Some(add) = field(&ops, &["add"]) {
         return pickups(object_items(&add));
     }
     // stacked pickups (keys, materials): { stack: { <fp>: { pickup_add_data: {...} } } }
     if let Some(Value::Object(stacked)) = field(&ops, &["stack"]) {
-        return stacked.iter().filter_map(|(fp, v)| field(v, PICKUP_FIELDS).map(|item| (Some(fp.clone()), item, false))).collect();
+        return stacked
+            .iter()
+            .filter_map(|(fp, v)| {
+                field(v, PICKUP_FIELDS).map(|item| (Some(fp.clone()), item, false))
+            })
+            .collect();
     }
     if let Some(added) = field(d, &["itemsAdded", "items_added"]) {
         return pickups(object_items(&added));
@@ -930,7 +1056,12 @@ fn item_sources(d: &Value) -> Vec<(Option<String>, Value, bool)> {
                 return vec![(own_fp, pickup, false)];
             }
             let nested: Vec<(Option<String>, Value)> = match &item_data {
-                Value::Object(map) => map.iter().filter_map(|(fp, v)| field(v, PICKUP_FIELDS).map(|item| (Some(fp.clone()), item))).collect(),
+                Value::Object(map) => map
+                    .iter()
+                    .filter_map(|(fp, v)| {
+                        field(v, PICKUP_FIELDS).map(|item| (Some(fp.clone()), item))
+                    })
+                    .collect(),
                 _ => vec![],
             };
             if !nested.is_empty() {
@@ -1057,7 +1188,9 @@ fn belongs_to_a_player(item: &Value) -> bool {
 /// ground carry, so a named one arriving that way is a shape the game already
 /// speaks, and refusing it would lose a real find.
 fn lies_on_the_floor(item: &Value) -> bool {
-    OWNER_FIELDS.iter().any(|f| field_ref(item, &[*f]).is_some())
+    OWNER_FIELDS
+        .iter()
+        .any(|f| field_ref(item, &[*f]).is_some())
 }
 
 /// Where an item says whose slot it is in, or which spot on the floor it is
@@ -1074,12 +1207,22 @@ fn item_events(d: &Value) -> Vec<GameEvent> {
     // `add` is keyed by fingerprint instead — so the object form is the one a
     // rename would land on. Every object-shaped `remove` in the captures here
     // is empty, so reading its keys costs nothing and would survive the swap.
-    let fps: Vec<String> = match field(d, &["operations"]).as_ref().and_then(|o| field(o, &["remove"])) {
-        Some(Value::Array(gone)) => gone.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+    let fps: Vec<String> = match field(d, &["operations"])
+        .as_ref()
+        .and_then(|o| field(o, &["remove"]))
+    {
+        Some(Value::Array(gone)) => gone
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
         Some(Value::Object(gone)) => gone.keys().cloned().collect(),
         _ => vec![],
     };
-    let mut out = match fps.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>() {
+    let mut out = match fps
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+    {
         fps if fps.is_empty() => vec![],
         fps => vec![GameEvent::ItemsLetGo(fps)],
     };
@@ -1111,7 +1254,11 @@ pub fn resolve_rarity(packet: &Value, name: &str, unscaled: bool) -> String {
     // the packet — already refused for Odyssey — left it Unknown. Filling the
     // table in for every item turned that accident into a claim, and an
     // Odyssey rune came back as a seasonal Common.
-    let known = if name.is_empty() || unscaled { None } else { crate::items::rarity_by_name(name) };
+    let known = if name.is_empty() || unscaled {
+        None
+    } else {
+        crate::items::rarity_by_name(name)
+    };
     // A named item's grade is a fact about that item, and the tables carry it
     // from the game's own data. The packet does not: over the 6,617 rolls one
     // session's capture recorded, its rarity field took two values, and one of
@@ -1132,7 +1279,11 @@ fn item_event(obj: &Value, fingerprint: Option<&str>, ground: bool) -> GameEvent
     let fp_type = fingerprint_type(fingerprint);
     let short_id = int_field(obj, &["b"]);
     let explicit_type = int_field(obj, &["type", "itemType", "item_type"]);
-    let item_type = if explicit_type != 0 { explicit_type } else { fp_type.unwrap_or(short_id) };
+    let item_type = if explicit_type != 0 {
+        explicit_type
+    } else {
+        fp_type.unwrap_or(short_id)
+    };
     let explicit_id = int_field(obj, &["id", "itemId", "item_id"]);
     let item_id = if explicit_id != 0 {
         explicit_id
@@ -1201,8 +1352,13 @@ fn item_event(obj: &Value, fingerprint: Option<&str>, ground: bool) -> GameEvent
     // Derived from the journal list rather than written out again, so the two
     // cannot drift apart: those five are exactly the rarities that make an item
     // worth naming below.
-    let named_only = crate::stats::rarity_from_packet(&claimed).is_some_and(|r| crate::stats::JOURNAL_RARITIES.contains(&r.as_str()));
-    let rarity = if odyssey || (plain_base && named_only) { Value::Null } else { claimed };
+    let named_only = crate::stats::rarity_from_packet(&claimed)
+        .is_some_and(|r| crate::stats::JOURNAL_RARITIES.contains(&r.as_str()));
+    let rarity = if odyssey || (plain_base && named_only) {
+        Value::Null
+    } else {
+        claimed
+    };
     // A name read out of the tables is a guess about which item this is, and a
     // guess must not become evidence about what it is worth. `resolve_rarity`
     // trusts the name over a weak packet rarity, so an ordinary base whose
@@ -1250,14 +1406,21 @@ fn item_event(obj: &Value, fingerprint: Option<&str>, ground: bool) -> GameEvent
     // grade at all. It was counted as one because the only test it had to pass
     // was being greater than zero.
     let claimed_tier = int_field(obj, &["tier", "n"]);
-    let tier = if odyssey || !(1..=crate::stats::SS_TIER).contains(&claimed_tier) { 0 } else { claimed_tier };
+    let tier = if odyssey || !(1..=crate::stats::SS_TIER).contains(&claimed_tier) {
+        0
+    } else {
+        claimed_tier
+    };
     let named_flag = int_field(obj, &["c"]) == 1;
     let resource = RESOURCE_TYPES.contains(&item_type);
-    let worth_naming = crate::stats::rarity_from_packet(&rarity).is_some_and(|r| crate::stats::JOURNAL_RARITIES.contains(&r.as_str()));
+    let worth_naming = crate::stats::rarity_from_packet(&rarity)
+        .is_some_and(|r| crate::stats::JOURNAL_RARITIES.contains(&r.as_str()));
     let name = if !explicit_name.is_empty() {
         explicit_name
     } else if named_flag || worth_naming || resource {
-        crate::items::item_name(item_type, item_id, weapon_type).unwrap_or_default().to_string()
+        crate::items::item_name(item_type, item_id, weapon_type)
+            .unwrap_or_default()
+            .to_string()
     } else {
         String::new()
     };
@@ -1279,7 +1442,55 @@ fn item_event(obj: &Value, fingerprint: Option<&str>, ground: bool) -> GameEvent
             _ => String::new(),
         },
         ground,
+        rolls: item_rolls(obj),
     }
+}
+
+/// Pull the two stat representations out of an inventory pickup.
+///
+/// A named item looks like `"154": 70`. A generated base also carries
+/// descriptor slots such as `"10": [39, 8, 30, 4]`, followed by the actual
+/// value under `"39"`. Boolean item flags are normalized to 1/0 so rules can
+/// target them too. Only numeric object keys and finite values are kept; the
+/// sibling `rarity` and `tier` fields therefore cannot enter the score.
+fn item_rolls(obj: &Value) -> ItemRolls {
+    let Some(Value::Object(stats)) = field(obj, &["stats"]) else {
+        return ItemRolls::default();
+    };
+    let mut out = ItemRolls::default();
+    for (key, value) in stats {
+        if let Ok(id) = key.parse::<u16>() {
+            let number = value
+                .as_f64()
+                .or_else(|| value.as_bool().map(|flag| if flag { 1.0 } else { 0.0 }));
+            if let Some(number) = number {
+                if number.is_finite() {
+                    out.values.push((id, number));
+                }
+                continue;
+            }
+        }
+        let Value::Array(parts) = value else { continue };
+        let Some(id) = parts
+            .first()
+            .and_then(Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+        else {
+            continue;
+        };
+        let Some(min) = parts.get(1).and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(max) = parts.get(2).and_then(Value::as_f64) else {
+            continue;
+        };
+        if min.is_finite() && max.is_finite() && min < max {
+            out.ranges.push((id, min, max));
+        }
+    }
+    out.values.sort_unstable_by_key(|(id, _)| *id);
+    out.ranges.sort_unstable_by_key(|(id, _, _)| *id);
+    out
 }
 
 /// Case-insensitive search that stays in the ORIGINAL string: lowercasing can
@@ -1291,7 +1502,8 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
     if n.is_empty() || h.len() < n.len() {
         return None;
     }
-    (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n) && haystack.is_char_boundary(i))
+    (0..=h.len() - n.len())
+        .find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n) && haystack.is_char_boundary(i))
 }
 
 /// The finder and what they found, out of "Ragnar just found [Azazel's Despair]".
@@ -1305,7 +1517,12 @@ fn announced_item_name(message: &str) -> Option<(String, String)> {
     let name = message[start..end].trim();
     // whatever the line opens with, up to the marker; the game puts a colour
     // tag or a channel prefix in front of the name often enough
-    let finder = message[..at].trim().rsplit(&[':', '>', ']'][..]).next().unwrap_or("").trim();
+    let finder = message[..at]
+        .trim()
+        .rsplit(&[':', '>', ']'][..])
+        .next()
+        .unwrap_or("")
+        .trim();
     (!name.is_empty()).then(|| (finder.to_string(), name.to_string()))
 }
 
@@ -1365,7 +1582,11 @@ fn effect_ids(raw: Option<Value>) -> Vec<u8> {
             })
             .filter_map(|n| u8::try_from(n).ok())
             .collect(),
-        Some(Value::String(s)) => s.replace(',', "|").split('|').filter_map(|b| b.trim().parse().ok()).collect(),
+        Some(Value::String(s)) => s
+            .replace(',', "|")
+            .split('|')
+            .filter_map(|b| b.trim().parse().ok())
+            .collect(),
         _ => vec![],
     }
 }
@@ -1425,9 +1646,31 @@ fn satanic_event(d: &Value) -> GameEvent {
         Some(v) => v.to_string(),
         None => String::new(),
     };
-    let buffs = effect_ids(field(d, &["buffs", "satanicZoneBuffs", "satanic_zone_buffs", "zoneBuffs", "zone_buffs"]));
-    let debuffs = effect_ids(field(d, &["debuffs", "satanicZoneDebuffs", "satanic_zone_debuffs", "zoneDebuffs", "zone_debuffs"]));
-    GameEvent::SatanicZone { zone, buffs, debuffs }
+    let buffs = effect_ids(field(
+        d,
+        &[
+            "buffs",
+            "satanicZoneBuffs",
+            "satanic_zone_buffs",
+            "zoneBuffs",
+            "zone_buffs",
+        ],
+    ));
+    let debuffs = effect_ids(field(
+        d,
+        &[
+            "debuffs",
+            "satanicZoneDebuffs",
+            "satanic_zone_debuffs",
+            "zoneDebuffs",
+            "zone_debuffs",
+        ],
+    ));
+    GameEvent::SatanicZone {
+        zone,
+        buffs,
+        debuffs,
+    }
 }
 
 #[cfg(test)]
@@ -1448,10 +1691,12 @@ mod tests {
             "act_previous": [1, 6, 0, 0],
             "act_zones_6": [0, 2, 1, 1, 1, 0, 0, 0, 0, 0]
         });
-        let act = events_from_messages(std::slice::from_ref(&bare)).into_iter().find_map(|e| match e {
-            GameEvent::Account { act, .. } => Some(act),
-            _ => None,
-        });
+        let act = events_from_messages(std::slice::from_ref(&bare))
+            .into_iter()
+            .find_map(|e| match e {
+                GameEvent::Account { act, .. } => Some(act),
+                _ => None,
+            });
         assert_eq!(act, Some(6), "the second element is the act");
 
         // and the same save arrives wrapped in a slot as well
@@ -1461,10 +1706,12 @@ mod tests {
             "season": 0, "hardcore": 0, "experience": 2370181,
             "slot_data": { "act_previous": [1, 6, 0, 0] }
         });
-        let act = events_from_messages(std::slice::from_ref(&wrapped)).into_iter().find_map(|e| match e {
-            GameEvent::Account { act, .. } => Some(act),
-            _ => None,
-        });
+        let act = events_from_messages(std::slice::from_ref(&wrapped))
+            .into_iter()
+            .find_map(|e| match e {
+                GameEvent::Account { act, .. } => Some(act),
+                _ => None,
+            });
         assert_eq!(act, Some(6));
     }
 
@@ -1488,7 +1735,10 @@ mod tests {
             matches!(events.first(), Some(GameEvent::Room(r)) if r == "Act_07_05"),
             "the act room comes only from this one: {events:?}"
         );
-        assert!(matches!(events.get(1), Some(GameEvent::Vitals { mf: None, .. })), "and it says nothing about magic find: {events:?}");
+        assert!(
+            matches!(events.get(1), Some(GameEvent::Vitals { mf: None, .. })),
+            "and it says nothing about magic find: {events:?}"
+        );
 
         // the other one says everything it says
         let beat = json!({
@@ -1518,7 +1768,16 @@ mod tests {
             "game_state": "eyJzbG90Ijo5LCJobGV2ZWwiOjIyLCJtZiI6MjI2OSwicm9vbSI6IkFjdF8wMV8wNSIsInNlc1RpbWUiOjEsImxldmVsIjoxMDAsInN6Ijp0cnVlfQ=="
         });
         let events = events_from_messages(std::slice::from_ref(&inside));
-        assert!(matches!(events.get(1), Some(GameEvent::Vitals { satanic_here: Some(true), .. })), "{events:?}");
+        assert!(
+            matches!(
+                events.get(1),
+                Some(GameEvent::Vitals {
+                    satanic_here: Some(true),
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
     }
 
     /// Leaving town and playing on, as the two packets really arrive.
@@ -1549,7 +1808,11 @@ mod tests {
             s.apply(&e);
         }
         let snap = s.snapshot(String::new());
-        assert_eq!(snap.room.as_deref(), Some("Act_07_05"), "the zone panel needs this");
+        assert_eq!(
+            snap.room.as_deref(),
+            Some("Act_07_05"),
+            "the zone panel needs this"
+        );
         assert_eq!(snap.mf, 1447, "silence about a number is not zero");
     }
 
@@ -1594,12 +1857,18 @@ mod tests {
         // and the server's own answers still do, both ways round
         let came = json!({"message": "New mail!", "status": 1});
         assert!(
-            matches!(events_from_messages(&[came]).first(), Some(GameEvent::Mail(true))),
+            matches!(
+                events_from_messages(&[came]).first(),
+                Some(GameEvent::Mail(true))
+            ),
             "the server saying so is still mail"
         );
         let none = json!({"message": "No new mail", "status": "0"});
         assert!(
-            matches!(events_from_messages(&[none]).first(), Some(GameEvent::Mail(false))),
+            matches!(
+                events_from_messages(&[none]).first(),
+                Some(GameEvent::Mail(false))
+            ),
             "and so is the server saying there is none"
         );
     }
@@ -1643,7 +1912,10 @@ mod tests {
                     {"a": 337583057, "b": 80, "c": 1, "d": 9, "e": 0, "gd": {"player": 0}, "j": 0, "sh": "a62f096b3a4f"}
             }
         });
-        assert!(events_from_messages(std::slice::from_ref(&stock)).is_empty(), "nothing in a shop window has dropped");
+        assert!(
+            events_from_messages(std::slice::from_ref(&stock)).is_empty(),
+            "nothing in a shop window has dropped"
+        );
 
         // and the drop answer beside it still lands. The same field carries the
         // world's id for the spot the thing is lying on when it is lying on one;
@@ -1658,7 +1930,10 @@ mod tests {
         });
         let events = events_from_messages(std::slice::from_ref(&dropped));
         assert!(
-            matches!(events.first(), Some(GameEvent::ItemAdded { ground: true, .. })),
+            matches!(
+                events.first(),
+                Some(GameEvent::ItemAdded { ground: true, .. })
+            ),
             "a thing with a place in the world is a drop: {events:?}"
         );
 
@@ -1678,7 +1953,10 @@ mod tests {
         });
         let events = events_from_messages(std::slice::from_ref(&by_position));
         assert!(
-            matches!(events.first(), Some(GameEvent::ItemAdded { ground: true, .. })),
+            matches!(
+                events.first(),
+                Some(GameEvent::ItemAdded { ground: true, .. })
+            ),
             "a position is a place too: {events:?}"
         );
     }
@@ -1705,13 +1983,31 @@ mod tests {
             }}
         });
         let events = events_from_messages(std::slice::from_ref(&msg));
-        let GameEvent::ItemAdded { name, rarity, item_type, item_id, .. } = &events[0] else {
+        let GameEvent::ItemAdded {
+            name,
+            rarity,
+            item_type,
+            item_id,
+            ..
+        } = &events[0]
+        else {
             panic!("not an item: {events:?}")
         };
-        assert_eq!((*item_type, *item_id), (10, 17), "it is the charm at 10:17:0");
-        assert_eq!(crate::items::item_name(10, 17, 0), Some("Wind Token"), "and the tables do answer for that triple");
+        assert_eq!(
+            (*item_type, *item_id),
+            (10, 17),
+            "it is the charm at 10:17:0"
+        );
+        assert_eq!(
+            crate::items::item_name(10, 17, 0),
+            Some("Wind Token"),
+            "and the tables do answer for that triple"
+        );
         assert_eq!(rarity, &Value::Null, "but a base claims no rarity");
-        assert!(name.is_empty(), "so it is left nameless, not called Wind Token");
+        assert!(
+            name.is_empty(),
+            "so it is left nameless, not called Wind Token"
+        );
     }
 
     /// A relic is Common and D-graded, and the packet is not allowed to say
@@ -1726,10 +2022,18 @@ mod tests {
     #[test]
     fn a_relic_is_what_the_tables_say_it_is() {
         let relic = "Jungle Vial";
-        assert_eq!(crate::items::rarity_by_name(relic), Some("Common"), "the table is right");
+        assert_eq!(
+            crate::items::rarity_by_name(relic),
+            Some("Common"),
+            "the table is right"
+        );
         assert_eq!(crate::items::tier_by_name(relic), 1, "tier D");
         for claim in [json!(7), json!(10), json!(2), Value::Null] {
-            assert_eq!(resolve_rarity(&claim, relic, false), "Common", "a packet claiming {claim} must not outrank the tables");
+            assert_eq!(
+                resolve_rarity(&claim, relic, false),
+                "Common",
+                "a packet claiming {claim} must not outrank the tables"
+            );
         }
         // and an item off a scale these tables do not read still claims nothing
         assert_eq!(resolve_rarity(&json!(7), relic, true), "Angelic");
@@ -1757,10 +2061,19 @@ mod tests {
         });
         let events = events_from_messages(std::slice::from_ref(&packet));
         let vitals = events.iter().find_map(|e| match e {
-            GameEvent::Vitals { mf, level, hlevel, satanic_here } => Some((*mf, *level, *hlevel, *satanic_here)),
+            GameEvent::Vitals {
+                mf,
+                level,
+                hlevel,
+                satanic_here,
+            } => Some((*mf, *level, *hlevel, *satanic_here)),
             _ => None,
         });
-        assert_eq!(vitals, Some((Some(1447), 100, 2, Some(false))), "events were {events:?}");
+        assert_eq!(
+            vitals,
+            Some((Some(1447), 100, 2, Some(false))),
+            "events were {events:?}"
+        );
     }
     /// The capture filter takes every plaintext TCP byte the machine sends or
     /// receives, so a bulk transfer on any other port arrives here as one
@@ -1776,8 +2089,15 @@ mod tests {
         let at = std::time::Instant::now();
         let messages = super::extract_messages(&buf);
         let took = at.elapsed();
-        assert!(took < std::time::Duration::from_secs(5), "512 KB of braces took {took:?}");
-        assert_eq!(messages.len(), 1, "the message before the noise is still read");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "512 KB of braces took {took:?}"
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "the message before the noise is still read"
+        );
     }
 
     /// Both spellings of the ownership marker, because the game sends both.
@@ -1791,14 +2111,23 @@ mod tests {
     fn the_merchant_is_recognised_under_either_spelling_of_the_marker() {
         for owner in ["gd", "gid"] {
             let item = json!({ owner: {"player": 0}, "a": 372940672, "b": 8, "c": 1 });
-            assert!(belongs_to_a_player(&item), "{owner} says whose slot it is in");
+            assert!(
+                belongs_to_a_player(&item),
+                "{owner} says whose slot it is in"
+            );
         }
         // and a position under either name is still the ground
         for where_at in ["gd", "gid"] {
             let item = json!({ where_at: {"pos": [11, 0]}, "a": 372940672 });
-            assert!(!belongs_to_a_player(&item), "{where_at} with a position is a drop");
+            assert!(
+                !belongs_to_a_player(&item),
+                "{where_at} with a position is a drop"
+            );
         }
-        assert!(!belongs_to_a_player(&json!({"a": 1})), "saying nothing is still a drop");
+        assert!(
+            !belongs_to_a_player(&json!({"a": 1})),
+            "saying nothing is still a drop"
+        );
     }
 
     /// Taking an item back off the trade board is not finding it.
@@ -1833,7 +2162,10 @@ mod tests {
             "fingerprint": "8-4559708-64f87be967fea0001-7",
             "item_data": {"a": 566876198, "b": 44, "c": 1, "d": 1, "e": 10, "j": 0, "w": 1}
         });
-        assert!(events_from_messages(&[listing]).is_empty(), "nor does putting one up");
+        assert!(
+            events_from_messages(&[listing]).is_empty(),
+            "nor does putting one up"
+        );
     }
 
     #[test]
@@ -1852,7 +2184,10 @@ mod tests {
             "item_mask": "1086337038",
             "item_name": "Pillar of Niflheim",
         });
-        assert!(super::events_from_messages(&[listing]).is_empty(), "selling an item we already own is not finding one");
+        assert!(
+            super::events_from_messages(&[listing]).is_empty(),
+            "selling an item we already own is not finding one"
+        );
 
         // and a drop answer still is a drop. Not the same item: the capture
         // this listing came from never saw that one fall, so the alternative to
@@ -1870,7 +2205,11 @@ mod tests {
             .into_iter()
             .filter(|e| matches!(e, super::GameEvent::ItemAdded { ground: true, .. }))
             .collect();
-        assert_eq!(found.len(), 1, "the generation answer is still read as a drop");
+        assert_eq!(
+            found.len(),
+            1,
+            "the generation answer is still read as a drop"
+        );
     }
 
     /// A real generation answer: the white sword rolled from base id 8 must not
@@ -1896,7 +2235,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(items, vec![("bb".to_string(), true)], "only the named drop is reported");
+        assert_eq!(
+            items,
+            vec![("bb".to_string(), true)],
+            "only the named drop is reported"
+        );
     }
 
     use super::*;
@@ -1935,7 +2278,9 @@ mod tests {
             "hardcore": "0", "season": "10", "unique_account_id": "4964607",
         });
         assert!(
-            !events_from_messages(std::slice::from_ref(&login)).iter().any(|e| matches!(e, GameEvent::ZoneRegion(_))),
+            !events_from_messages(std::slice::from_ref(&login))
+                .iter()
+                .any(|e| matches!(e, GameEvent::ZoneRegion(_))),
             "a packet that merely mentions the region is not asking about the zone"
         );
     }
@@ -1953,7 +2298,9 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[0], GameEvent::Gold(c) if c.gss == 100));
         assert!(matches!(events[1], GameEvent::XpGain(15)));
-        assert!(matches!(&events[2], GameEvent::SatanicZone { zone, buffs, .. } if zone == "SZ_1_1" && buffs == &[1, 26]));
+        assert!(
+            matches!(&events[2], GameEvent::SatanicZone { zone, buffs, .. } if zone == "SZ_1_1" && buffs == &[1, 26])
+        );
     }
 
     #[test]
@@ -1968,13 +2315,16 @@ mod tests {
         // a length prefix between two messages must not swallow either
         let raw = b"\x00\x1f{\"currency_data\":{\"GSS\":7}}\x00\x05{\"total_guild_xp\":3,\"message\":\"Gained 9 XP\"}";
         let events = events_from_messages(&extract_messages(raw));
-        assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 7)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 7)));
         assert!(events.iter().any(|e| matches!(e, GameEvent::XpGain(9))));
     }
 
     #[test]
     fn capture_accepts_json_arrays_with_junk_around() {
-        let raw = b"\x01prefix [{\"total_guild_xp\": 500, \"message\": \"Gained 15 XP\"}] suffix\x00";
+        let raw =
+            b"\x01prefix [{\"total_guild_xp\": 500, \"message\": \"Gained 15 XP\"}] suffix\x00";
         let messages = extract_messages(raw);
         assert_eq!(messages.len(), 1);
         let events = events_from_messages(&messages);
@@ -1998,14 +2348,66 @@ mod tests {
         let parsed: Vec<(String, bool, i64, i64)> = events
             .iter()
             .map(|e| match e {
-                GameEvent::ItemAdded { rarity, mf, item_type, item_id, .. } => (rarity.to_string(), *mf, *item_type, *item_id),
+                GameEvent::ItemAdded {
+                    rarity,
+                    mf,
+                    item_type,
+                    item_id,
+                    ..
+                } => (rarity.to_string(), *mf, *item_type, *item_id),
                 _ => panic!("not an item"),
             })
             .collect();
         // fingerprint suffix carries the item type; `b` is then the id-in-category
-        assert!(parsed.contains(&("6".into(), true, 1, 71)), "a named item keeps its claim");
+        assert!(
+            parsed.contains(&("6".into(), true, 1, 71)),
+            "a named item keeps its claim"
+        );
         // and the base beside it does not: 9 is Heroic, which no base is
         assert!(parsed.contains(&("null".into(), false, 6, 8)));
+    }
+
+    #[test]
+    fn pickup_keeps_exact_item_rolls_and_ignores_stat_metadata() {
+        let payload = json!({
+            "status": 1,
+            "message": "Success on inventory update ext",
+            "operations": {"add": {
+                "10-4324110-659fe99eaae3e0003-0": {
+                    "a": 7149768, "b": 21, "c": 1, "d": 2, "e": 11,
+                    "j": 0, "sh": "83a617dfcfb5",
+                    "stats": {
+                        "154": 70, "29": 138, "48": 23, "68": 17,
+                        "97": 11, "288": true, "rarity": 6, "tier": 4
+                    }
+                }
+            }}
+        });
+        let events = events_from_messages(std::slice::from_ref(&payload));
+        let GameEvent::ItemAdded { rolls, .. } = &events[0] else {
+            panic!("not an item")
+        };
+        assert_eq!(
+            rolls.values,
+            vec![
+                (29, 138.0),
+                (48, 23.0),
+                (68, 17.0),
+                (97, 11.0),
+                (154, 70.0),
+                (288, 1.0)
+            ]
+        );
+        assert!(
+            rolls.ranges.is_empty(),
+            "named items carry values; their ranges are static"
+        );
+
+        let generated = item_rolls(&json!({
+            "stats": {"10": [39, 8, 30, 4], "39": 28, "rarity": 5, "tier": 4}
+        }));
+        assert_eq!(generated.values, vec![(39, 28.0)]);
+        assert_eq!(generated.ranges, vec![(39, 8.0, 30.0)]);
     }
 
     /// The same complaint as the Odyssey one, from packets that carry none of
@@ -2017,12 +2419,28 @@ mod tests {
     #[test]
     fn the_tables_outrank_the_packet_for_a_named_item() {
         let ring = "Apex Striker's Ring";
-        assert_eq!(crate::items::rarity_by_name(ring), Some("Satanic"), "the table is right");
+        assert_eq!(
+            crate::items::rarity_by_name(ring),
+            Some("Satanic"),
+            "the table is right"
+        );
         assert_eq!(crate::items::tier_by_name(ring), 1, "and grades it D");
         // whatever the packet claims about it
-        assert_eq!(resolve_rarity(&json!(7), ring, false), "Satanic", "a packet claiming Angelic");
-        assert_eq!(resolve_rarity(&json!(2), ring, false), "Satanic", "and one claiming Superior");
-        assert_eq!(resolve_rarity(&Value::Null, ring, false), "Satanic", "and one claiming nothing");
+        assert_eq!(
+            resolve_rarity(&json!(7), ring, false),
+            "Satanic",
+            "a packet claiming Angelic"
+        );
+        assert_eq!(
+            resolve_rarity(&json!(2), ring, false),
+            "Satanic",
+            "and one claiming Superior"
+        );
+        assert_eq!(
+            resolve_rarity(&Value::Null, ring, false),
+            "Satanic",
+            "and one claiming nothing"
+        );
         // an item the tables have never heard of still keeps what it was sent
         assert_eq!(resolve_rarity(&json!(7), "No Such Item", false), "Angelic");
     }
@@ -2039,21 +2457,36 @@ mod tests {
                 "message": "Success on inventory update ext",
                 "operations": { "add": { fp: item } }
             });
-            events_from_messages(&[msg]).into_iter().find_map(|e| match e {
-                GameEvent::ItemAdded { name, rarity, tier, .. } => Some((name, rarity, tier)),
-                _ => None,
-            })
+            events_from_messages(&[msg])
+                .into_iter()
+                .find_map(|e| match e {
+                    GameEvent::ItemAdded {
+                        name, rarity, tier, ..
+                    } => Some((name, rarity, tier)),
+                    _ => None,
+                })
         };
         // a key: type 12, ordinary as every key is, arriving with the d = 7 the
         // rule above refuses
-        let (name, rarity, _) = pickup("7-1-12", json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "j": 0})).unwrap();
+        let (name, rarity, _) = pickup(
+            "7-1-12",
+            json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "j": 0}),
+        )
+        .unwrap();
         assert_eq!(name, "Basic Key", "a key is still a key");
         assert_eq!(rarity, Value::Null, "and still claims no grade of its own");
 
         // and an equipment base in the same shape stays nameless, which is the
         // whole point of the rule
-        let (name, _, _) = pickup("7-1-3", json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "j": 7})).unwrap();
-        assert_eq!(name, "", "an ordinary weapon is not read through the unique table");
+        let (name, _, _) = pickup(
+            "7-1-3",
+            json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "j": 7}),
+        )
+        .unwrap();
+        assert_eq!(
+            name, "",
+            "an ordinary weapon is not read through the unique table"
+        );
     }
 
     #[test]
@@ -2064,13 +2497,20 @@ mod tests {
                 "message": "Success on inventory update ext",
                 "operations": { "add": { "7-4964607-6593db690c6090001-3": item } }
             });
-            events_from_messages(&[msg]).into_iter().find_map(|e| match e {
-                GameEvent::ItemAdded { rarity, .. } => Some(rarity),
-                _ => None,
-            })
+            events_from_messages(&[msg])
+                .into_iter()
+                .find_map(|e| match e {
+                    GameEvent::ItemAdded { rarity, .. } => Some(rarity),
+                    _ => None,
+                })
         };
-        let plain = json!({"a": 116892350, "b": 0, "c": 0, "d": 7, "e": 10, "j": 7, "n": 2, "sh": "cb"});
-        assert_eq!(pickup(plain), Some(Value::Null), "an ordinary base claims no grade");
+        let plain =
+            json!({"a": 116892350, "b": 0, "c": 0, "d": 7, "e": 10, "j": 7, "n": 2, "sh": "cb"});
+        assert_eq!(
+            pickup(plain),
+            Some(Value::Null),
+            "an ordinary base claims no grade"
+        );
 
         // Heroic is no more a base's rarity than Angelic is.
         //
@@ -2087,7 +2527,11 @@ mod tests {
 
         // the grades a base really can carry are still believed
         let white = json!({"a": 1, "b": 8, "c": 0, "d": 2, "e": 10, "j": 0, "sh": "cb"});
-        assert_eq!(pickup(white), Some(json!(2)), "Superior on a base is its own");
+        assert_eq!(
+            pickup(white),
+            Some(json!(2)),
+            "Superior on a base is its own"
+        );
 
         // and a named item keeps its own claim, Angelic included
         let named = json!({"a": 1, "b": 71, "c": 1, "d": 7, "e": 10, "j": 0, "sh": "cb"});
@@ -2115,7 +2559,9 @@ mod tests {
         // own `c`, with no name — claiming the top grade. Ten of these were the
         // SS column on a practice run.
         assert_eq!(
-            grade_of(&pickup(json!({"a": 1, "b": 0, "c": 0, "d": 3, "e": 0, "h": 1, "n": 6, "sh": "x"}))),
+            grade_of(&pickup(
+                json!({"a": 1, "b": 0, "c": 0, "d": 3, "e": 0, "h": 1, "n": 6, "sh": "x"})
+            )),
             0,
             "Odyssey's grade is on its own scale, like its rarity"
         );
@@ -2123,14 +2569,26 @@ mod tests {
         // And a number that is not a grade in any mode. Also from the capture,
         // in both modes.
         assert_eq!(
-            grade_of(&pickup(json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "n": 6666, "sh": "x"}))),
+            grade_of(&pickup(
+                json!({"a": 1, "b": 0, "c": 0, "d": 7, "e": 10, "n": 6666, "sh": "x"})
+            )),
             0,
             "6666 is not a grade; it only ever passed for being above zero"
         );
 
         // A seasonal grade is still read, including the top one.
-        assert_eq!(grade_of(&pickup(json!({"a": 1, "c": 1, "d": 2, "e": 10, "n": 4, "sh": "x"}))), 4);
-        assert_eq!(grade_of(&pickup(json!({"a": 1, "c": 1, "d": 2, "e": 10, "n": 6, "sh": "x"}))), 6);
+        assert_eq!(
+            grade_of(&pickup(
+                json!({"a": 1, "c": 1, "d": 2, "e": 10, "n": 4, "sh": "x"})
+            )),
+            4
+        );
+        assert_eq!(
+            grade_of(&pickup(
+                json!({"a": 1, "c": 1, "d": 2, "e": 10, "n": 6, "sh": "x"})
+            )),
+            6
+        );
     }
 
     #[test]
@@ -2146,8 +2604,20 @@ mod tests {
             }}
         });
         let events = events_from_messages(std::slice::from_ref(&odyssey));
-        let GameEvent::ItemAdded { name, rarity, unscaled, .. } = &events[0] else { panic!("not an item") };
-        assert_eq!(resolve_rarity(rarity, name, *unscaled), "Unknown", "its scale is not ours to read");
+        let GameEvent::ItemAdded {
+            name,
+            rarity,
+            unscaled,
+            ..
+        } = &events[0]
+        else {
+            panic!("not an item")
+        };
+        assert_eq!(
+            resolve_rarity(rarity, name, *unscaled),
+            "Unknown",
+            "its scale is not ours to read"
+        );
 
         // the seasonal shape of the same capture keeps working
         let seasonal = json!({
@@ -2158,7 +2628,15 @@ mod tests {
             }}
         });
         let events = events_from_messages(std::slice::from_ref(&seasonal));
-        let GameEvent::ItemAdded { name, rarity, unscaled, .. } = &events[0] else { panic!("not an item") };
+        let GameEvent::ItemAdded {
+            name,
+            rarity,
+            unscaled,
+            ..
+        } = &events[0]
+        else {
+            panic!("not an item")
+        };
         assert_eq!(resolve_rarity(rarity, name, *unscaled), "Superior");
     }
 
@@ -2173,9 +2651,24 @@ mod tests {
             "operations": { "add": { "8-18": {"e": 10, "a": 42, "j": 0, "b": 8, "d": 2, "c": 0} } }
         });
         let events = events_from_messages(std::slice::from_ref(&payload));
-        let GameEvent::ItemAdded { name, rarity, unscaled, .. } = &events[0] else { panic!("not an item") };
-        assert_eq!(name, "", "an ordinary base is nameless; the table knows only uniques");
-        assert_eq!(resolve_rarity(rarity, name, *unscaled), "Superior", "and it keeps the rarity it was sent with");
+        let GameEvent::ItemAdded {
+            name,
+            rarity,
+            unscaled,
+            ..
+        } = &events[0]
+        else {
+            panic!("not an item")
+        };
+        assert_eq!(
+            name, "",
+            "an ordinary base is nameless; the table knows only uniques"
+        );
+        assert_eq!(
+            resolve_rarity(rarity, name, *unscaled),
+            "Superior",
+            "and it keeps the rarity it was sent with"
+        );
 
         // the same slot, flagged by the game as a named item, still resolves
         let named = json!({
@@ -2184,7 +2677,15 @@ mod tests {
             "operations": { "add": { "8-18": {"e": 10, "a": 42, "j": 0, "b": 8, "d": 2, "c": 1} } }
         });
         let events = events_from_messages(std::slice::from_ref(&named));
-        let GameEvent::ItemAdded { name, rarity, unscaled, .. } = &events[0] else { panic!("not an item") };
+        let GameEvent::ItemAdded {
+            name,
+            rarity,
+            unscaled,
+            ..
+        } = &events[0]
+        else {
+            panic!("not an item")
+        };
         assert_eq!(name, "Gold Inlaid Mysterious Potion");
         assert_eq!(resolve_rarity(rarity, name, *unscaled), "Angelic");
     }
@@ -2201,7 +2702,12 @@ mod tests {
         let raw = b"\x01account_id=5&currency_data=%7B%22GSS%22%3A727015%7D&checksum=ab\x00";
         let messages = extract_messages(raw);
         let events = events_from_messages(&messages);
-        assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 727015)), "no gold in {messages:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 727015)),
+            "no gold in {messages:?}"
+        );
     }
 
     #[test]
@@ -2221,20 +2727,29 @@ mod tests {
         // single-letter keys are common; "a"/"d" alone must not mint an item
         let payload = json!({"route": "party/update", "a": 5, "d": 6});
         let events = events_from_messages(std::slice::from_ref(&payload));
-        assert!(!events.iter().any(|e| matches!(e, GameEvent::ItemAdded { .. })), "spurious item from {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::ItemAdded { .. })),
+            "spurious item from {events:?}"
+        );
         // a spelled-out payload is still an item
         let real = json!({"seed": 991, "rarity": 6, "type": 1});
-        assert!(events_from_messages(std::slice::from_ref(&real)).iter().any(|e| matches!(e, GameEvent::ItemAdded { .. })));
+        assert!(events_from_messages(std::slice::from_ref(&real))
+            .iter()
+            .any(|e| matches!(e, GameEvent::ItemAdded { .. })));
     }
 
     #[test]
     fn audit_mail_text_variants() {
         let mail = |text: &str| {
             let payload = json!({"message": text});
-            events_from_messages(std::slice::from_ref(&payload)).into_iter().find_map(|e| match e {
-                GameEvent::Mail(v) => Some(v),
-                _ => None,
-            })
+            events_from_messages(std::slice::from_ref(&payload))
+                .into_iter()
+                .find_map(|e| match e {
+                    GameEvent::Mail(v) => Some(v),
+                    _ => None,
+                })
         };
         assert_eq!(mail("You have new mail!"), Some(true));
         assert_eq!(mail("No new mail"), Some(false));
@@ -2245,10 +2760,12 @@ mod tests {
     #[test]
     fn an_item_with_mail_in_its_name_is_not_mail() {
         let mail = |text: &str| {
-            events_from_messages(&[json!({ "message": text })]).into_iter().find_map(|e| match e {
-                GameEvent::Mail(has) => Some(has),
-                _ => None,
-            })
+            events_from_messages(&[json!({ "message": text })])
+                .into_iter()
+                .find_map(|e| match e {
+                    GameEvent::Mail(has) => Some(has),
+                    _ => None,
+                })
         };
         // a real Set item, announced to the whole shard
         assert_eq!(mail("Ragnar just found [Lost Master's Platemail]"), None);
@@ -2279,7 +2796,8 @@ mod tests {
 
     #[test]
     fn satanic_zone_carries_debuffs() {
-        let payload = json!({"satanic_zone_name": "SZ_2_5", "zone_buffs": [17, 10], "zone_debuffs": "11|13"});
+        let payload =
+            json!({"satanic_zone_name": "SZ_2_5", "zone_buffs": [17, 10], "zone_debuffs": "11|13"});
         let events = events_from_messages(std::slice::from_ref(&payload));
         assert!(matches!(
             &events[0],
@@ -2318,7 +2836,9 @@ mod tests {
         asm.push(world, 7, b"position noise");
         asm.push(world, 8, b"more noise");
         asm.push(save, 1, b"42}}");
-        let flushed = asm.push(save, 2, b"x").expect("the save flushes on its own ack");
+        let flushed = asm
+            .push(save, 2, b"x")
+            .expect("the save flushes on its own ack");
         let messages = extract_messages(&flushed);
         assert_eq!(messages.len(), 1, "the save survived the flood");
         assert_eq!(messages[0]["currency_data"]["GSS"], 42);
@@ -2342,7 +2862,10 @@ mod tests {
         for ack in 3..8 {
             if let Some(flushed) = asm.push(flow, ack, b"x") {
                 let events = events_from_messages(&extract_messages(&flushed));
-                if events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 11)) {
+                if events
+                    .iter()
+                    .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 11))
+                {
                     return;
                 }
             }
@@ -2359,7 +2882,12 @@ mod tests {
         asm.push(flow, 1, b"\x01{\x02noise{\"currency_data\":{\"GSS\":5}}");
         let flushed = asm.push(flow, 2, b"x").unwrap();
         let events = events_from_messages(&extract_messages(&flushed));
-        assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 5)), "capture stalled on a stray brace");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 5)),
+            "capture stalled on a stray brace"
+        );
     }
 
     #[test]
@@ -2370,13 +2898,22 @@ mod tests {
         // already closed by the time the cut lands. Deciding the carry on
         // "does anything complete follow the opener" read that inner object
         // and called the whole message framing noise, so the drop was dropped.
-        asm.push(flow, 1, b"{\"itemData\":{\"7-1-1\":{\"n\":1}},\"currency_data\":{\"GSS\":7");
+        asm.push(
+            flow,
+            1,
+            b"{\"itemData\":{\"7-1-1\":{\"n\":1}},\"currency_data\":{\"GSS\":7",
+        );
         let first = asm.push(flow, 2, b"}}").unwrap();
-        assert!(extract_messages(&first).is_empty(), "half a message must not parse");
+        assert!(
+            extract_messages(&first).is_empty(),
+            "half a message must not parse"
+        );
         let second = asm.push(flow, 3, b"noise").unwrap();
         let events = events_from_messages(&extract_messages(&second));
         assert!(
-            events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 7)),
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 7)),
             "a message cut after a closed inner value was thrown away"
         );
     }
@@ -2395,7 +2932,12 @@ mod tests {
         assert!(extract_messages(&first).is_empty());
         let second = asm.push(flow, 3, b"noise").unwrap();
         let events = events_from_messages(&extract_messages(&second));
-        assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 9)), "a 20 KB tail was refused");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 9)),
+            "a 20 KB tail was refused"
+        );
     }
 
     #[test]
@@ -2405,9 +2947,17 @@ mod tests {
         // the ack moves on while the object is still open
         asm.push(flow, 1, b"{\"currency_data\":{\"GSS\":42");
         let first = asm.push(flow, 2, b"}}").unwrap();
-        assert!(extract_messages(&first).is_empty(), "half a message must not parse");
+        assert!(
+            extract_messages(&first).is_empty(),
+            "half a message must not parse"
+        );
         let second = asm.push(flow, 3, b"noise").unwrap();
         let events = events_from_messages(&extract_messages(&second));
-        assert!(events.iter().any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 42)), "message lost across the flush boundary");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Gold(c) if c.gss == 42)),
+            "message lost across the flush boundary"
+        );
     }
 }

@@ -12,7 +12,9 @@ fn main() {
     #[cfg(windows)]
     {
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        let dir = std::path::PathBuf::from(root).join("System32").join("Npcap");
+        let dir = std::path::PathBuf::from(root)
+            .join("System32")
+            .join("Npcap");
         let path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{};{}", dir.display(), path));
     }

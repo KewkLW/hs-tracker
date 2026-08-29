@@ -12,7 +12,14 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const manifest = join('src-tauri', 'Cargo.toml');
 
-execFileSync(process.execPath, ['--test', 'src/xp.test.js'], {
+execFileSync(process.execPath, [
+  '--test',
+  'src/xp.test.js',
+  'src/item-stats.test.js',
+  'src/fx-presets.test.js',
+  'src/twitch-config.test.js',
+  'src/flourish-family.test.js',
+], {
   cwd: root,
   stdio: 'inherit',
 });

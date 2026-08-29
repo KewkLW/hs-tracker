@@ -330,6 +330,16 @@
         through one.
       </div>
       <div class="line" data-tauri-drag-region>
+        <button
+          class="check"
+          onclick={() => { settings.debug_mode = !settings.debug_mode; save(); }}
+          aria-label="debug mode"
+        >
+          <img src={settings.debug_mode ? art('check_on') : art('check_off')} alt="" />
+        </button>
+        <span class="opt">Debug Mode — show the experimental FX and Twitch tabs</span>
+      </div>
+      <div class="line" data-tauri-drag-region>
         <button class="check" onclick={() => { settings.debug_log = !settings.debug_log; save(); }} aria-label="debug">
           <img src={settings.debug_log ? art('check_on') : art('check_off')} alt="" />
         </button>

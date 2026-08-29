@@ -77,7 +77,13 @@ impl Status {
             Status::NoAccess => "no-access".into(),
             Status::NoInterface => "no-interface".into(),
             Status::WaitingForGame => "waiting-for-game".into(),
-            Status::Capturing { iface, hosts, dropped, packets, deaf } => {
+            Status::Capturing {
+                iface,
+                hosts,
+                dropped,
+                packets,
+                deaf,
+            } => {
                 let deaf = match deaf {
                     Deaf::No => 0,
                     Deaf::Narrow => 1,
@@ -196,7 +202,10 @@ fn npcap_dir() -> PathBuf {
 /// worth reporting before anything else is attempted.
 #[cfg(windows)]
 pub fn capture_available() -> bool {
-    npcap_dir().join("wpcap.dll").exists() || npcap_dir().parent().is_some_and(|s| s.join("wpcap.dll").exists())
+    npcap_dir().join("wpcap.dll").exists()
+        || npcap_dir()
+            .parent()
+            .is_some_and(|s| s.join("wpcap.dll").exists())
 }
 
 /// Elsewhere libpcap is a package dependency and listing devices needs no
@@ -221,7 +230,14 @@ pub fn capture_available() -> bool {
             crate::log::once(
                 "capture-probe",
                 "warn",
-                format!("cannot open {name} for capture: {e}{}", if refused { " - the binary needs cap_net_raw" } else { "" }),
+                format!(
+                    "cannot open {name} for capture: {e}{}",
+                    if refused {
+                        " - the binary needs cap_net_raw"
+                    } else {
+                        ""
+                    }
+                ),
             );
             !refused
         }
@@ -245,9 +261,17 @@ fn game_pids(sys: &mut System) -> Vec<u32> {
     // Only names are wanted here. The default refresh also reads memory, io and
     // the executable path of every process on the box, three times a second,
     // for the whole time the game is not running.
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet));
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
     let looks_like_it = |s: &str| {
-        let flat: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        let flat: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
         flat.starts_with("herosiege")
     };
     sys.processes()
@@ -258,10 +282,14 @@ fn game_pids(sys: &mut System) -> Vec<u32> {
             // executable path or the command line instead, and matching the
             // comm alone would find nothing at all.
             looks_like_it(&p.name().to_string_lossy())
-                || p.exe().and_then(|e| e.file_name()).is_some_and(|f| looks_like_it(&f.to_string_lossy()))
-                || p.cmd()
-                    .first()
-                    .is_some_and(|a| std::path::Path::new(a).file_name().is_some_and(|f| looks_like_it(&f.to_string_lossy())))
+                || p.exe()
+                    .and_then(|e| e.file_name())
+                    .is_some_and(|f| looks_like_it(&f.to_string_lossy()))
+                || p.cmd().first().is_some_and(|a| {
+                    std::path::Path::new(a)
+                        .file_name()
+                        .is_some_and(|f| looks_like_it(&f.to_string_lossy()))
+                })
         })
         .map(|(pid, _)| pid.as_u32())
         .collect()
@@ -334,7 +362,11 @@ fn capture_devices() -> Vec<pcap::Device> {
     // the same traffic is inside the tunnel. So the app excluded the one device
     // that would have worked, before ever asking Npcap, and reported nine
     // packets in ninety seconds with the filter already wide open.
-    let kept: Vec<pcap::Device> = all.iter().filter(|d| worth_capturing(&d.addresses) && is_a_network(&d.name)).cloned().collect();
+    let kept: Vec<pcap::Device> = all
+        .iter()
+        .filter(|d| worth_capturing(&d.addresses) && is_a_network(&d.name))
+        .cloned()
+        .collect();
 
     // Which adapters exist, and which were passed over. Every report of nothing
     // being counted has turned on this list and none of them arrived with it.
@@ -343,7 +375,10 @@ fn capture_devices() -> Vec<pcap::Device> {
         "info",
         format!(
             "adapters: {}{}",
-            kept.iter().map(|d| d.desc.clone().unwrap_or_else(|| d.name.clone())).collect::<Vec<_>>().join(", "),
+            kept.iter()
+                .map(|d| d.desc.clone().unwrap_or_else(|| d.name.clone()))
+                .collect::<Vec<_>>()
+                .join(", "),
             {
                 let skipped: Vec<String> = all
                     .iter()
@@ -387,7 +422,10 @@ fn worth_capturing(addresses: &[pcap::Address]) -> bool {
 /// through is caught after the fact by `unusable_device`.
 fn is_a_network(name: &str) -> bool {
     const PSEUDO: [&str; 5] = ["any", "nflog", "nfqueue", "dbus-system", "dbus-session"];
-    !PSEUDO.contains(&name) && !name.starts_with("bluetooth") && !name.starts_with("usbmon") && !name.starts_with("nfqueue:")
+    !PSEUDO.contains(&name)
+        && !name.starts_with("bluetooth")
+        && !name.starts_with("usbmon")
+        && !name.starts_with("nfqueue:")
 }
 
 /// Whether a capture ended because the device is not one we can read, rather
@@ -447,11 +485,13 @@ fn unoffload(data: &[u8], ip_start: usize) -> Option<Vec<u8>> {
     // the header in.
     let (at, declared, want) = match version {
         4 => {
-            let d = u16::from_be_bytes([*data.get(ip_start + 2)?, *data.get(ip_start + 3)?]) as usize;
+            let d =
+                u16::from_be_bytes([*data.get(ip_start + 2)?, *data.get(ip_start + 3)?]) as usize;
             (ip_start + 2, d, here)
         }
         6 => {
-            let d = u16::from_be_bytes([*data.get(ip_start + 4)?, *data.get(ip_start + 5)?]) as usize;
+            let d =
+                u16::from_be_bytes([*data.get(ip_start + 4)?, *data.get(ip_start + 5)?]) as usize;
             (ip_start + 4, d + 40, here.checked_sub(40)?)
         }
         _ => return None,
@@ -490,7 +530,11 @@ fn unoffload(data: &[u8], ip_start: usize) -> Option<Vec<u8>> {
 /// a wide filter on a busy machine hands this thread every plaintext byte the
 /// machine sends.
 fn wide_capture() -> bool {
-    WIDE.load(Ordering::Relaxed) || matches!(std::env::var("HS_WIDE_CAPTURE").as_deref(), Ok("1") | Ok("true"))
+    WIDE.load(Ordering::Relaxed)
+        || matches!(
+            std::env::var("HS_WIDE_CAPTURE").as_deref(),
+            Ok("1") | Ok("true")
+        )
 }
 
 /// The far end, and only the far end.
@@ -580,7 +624,15 @@ fn denied_open(e: &pcap::Error) -> bool {
         pcap::Error::ErrnoError(errno) => matches!(errno.0, 1 | 13),
         other => {
             let text = other.to_string().to_lowercase();
-            ["permission", "not permitted", "cap_net_raw", "denied", "root"].iter().any(|m| text.contains(m))
+            [
+                "permission",
+                "not permitted",
+                "cap_net_raw",
+                "denied",
+                "root",
+            ]
+            .iter()
+            .any(|m| text.contains(m))
         }
     }
 }
@@ -653,7 +705,10 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                 // The game appearing is the one reset with a blackout behind
                 // it: the zone carried over from the last session, and nothing
                 // says it is still the zone.
-                stats.lock().unwrap_or_else(|e| e.into_inner()).reset_after_blackout();
+                stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reset_after_blackout();
                 if auto {
                     crate::show_overlay(&app);
                 }
@@ -677,7 +732,11 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
             hosts = remote.len();
             wanted = capture_devices();
             let narrow = scope_for(&remote);
-            let next = if wide_capture() { "tcp".to_string() } else { narrow };
+            let next = if wide_capture() {
+                "tcp".to_string()
+            } else {
+                narrow
+            };
             if next != scope {
                 crate::log::say("net", &format!("capture filter: {next}"));
                 scope = next;
@@ -691,10 +750,14 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         // An adapter is only judged against one that is working: with the game
         // sitting in a menu nothing arrives anywhere, and retiring every
         // capture then would leave us deaf until the retry window passes.
-        let productive = captures.values().any(|c| c.hits.load(Ordering::Relaxed) > 0);
+        let productive = captures
+            .values()
+            .any(|c| c.hits.load(Ordering::Relaxed) > 0);
         captures.retain(|name, c| {
             // give a new capture a while to prove itself, then judge it
-            let silent = productive && c.started.elapsed() >= Duration::from_secs(45) && c.hits.load(Ordering::Relaxed) == 0;
+            let silent = productive
+                && c.started.elapsed() >= Duration::from_secs(45)
+                && c.hits.load(Ordering::Relaxed) == 0;
             // A thread that ended by itself without a single message could not
             // open the adapter — the usual state of a Linux binary without
             // cap_net_raw. Re-opening it every second forever would be a busy
@@ -709,10 +772,18 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                 // within seconds, and five minutes of deafness after every
                 // reconnect is not a diagnosis, it is a wait.
                 let opened = c.opened.load(Ordering::Relaxed);
-                let rest = if opened { Duration::from_secs(10) } else { Duration::from_secs(300) };
+                let rest = if opened {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_secs(300)
+                };
                 barren.insert(name.clone(), (std::time::Instant::now(), rest));
             }
-            let keep = running && !silent && !c.handle.is_finished() && c.scope == scope && wanted.iter().any(|d| d.name == *name);
+            let keep = running
+                && !silent
+                && !c.handle.is_finished()
+                && c.scope == scope
+                && wanted.iter().any(|d| d.name == *name);
             if !keep {
                 c.stop.store(true, Ordering::Relaxed);
             }
@@ -735,27 +806,42 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
             let opened = Arc::new(AtomicBool::new(false));
             let handle = {
                 let name = dev.name.clone();
-                let (stop, stats, status, app) = (stop.clone(), stats.clone(), status.clone(), app.clone());
-                let (dev, dropped, scope, hits) = (dev.clone(), dropped.clone(), scope.clone(), hits.clone());
+                let (stop, stats, status, app) =
+                    (stop.clone(), stats.clone(), status.clone(), app.clone());
+                let (dev, dropped, scope, hits) =
+                    (dev.clone(), dropped.clone(), scope.clone(), hits.clone());
                 let (packets, tls) = (packets.clone(), tls.clone());
                 let opened = opened.clone();
                 std::thread::spawn(move || {
                     // "no interface" is the wrong story when the adapter is
                     // there and the process simply may not open it — the usual
                     // state of a fresh Linux install without cap_net_raw.
-                    if let Err(e) = capture_loop(dev, scope, stop, stats, dropped, hits, packets, tls, opened, &app) {
+                    if let Err(e) = capture_loop(
+                        dev, scope, stop, stats, dropped, hits, packets, tls, opened, &app,
+                    ) {
                         // Something libpcap lists but cannot filter on. Said
                         // once, at a level nobody has to act on, and left alone
                         // from then on — the status line belongs to the
                         // adapters that can actually carry the game.
                         if unusable_device(&e) {
-                            crate::log::once(&format!("unusable:{name}"), "info", format!("{name} is not a device we can read: {e}"));
+                            crate::log::once(
+                                &format!("unusable:{name}"),
+                                "info",
+                                format!("{name} is not a device we can read: {e}"),
+                            );
                             return;
                         }
                         let refused = denied_open(&e);
                         // The README asks for this log when something is wrong;
                         // until now the whole module never wrote a line to it.
-                        crate::log::warn(format!("capture on {name} ended: {e}{}", if refused { " - the binary needs cap_net_raw" } else { "" }));
+                        crate::log::warn(format!(
+                            "capture on {name} ended: {e}{}",
+                            if refused {
+                                " - the binary needs cap_net_raw"
+                            } else {
+                                ""
+                            }
+                        ));
                         // Refused is not the same as absent. If the driver is
                         // there, the answer the user needs is about rights, not
                         // about installing anything.
@@ -793,13 +879,22 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
         // finished yet" is also true of one spawned a moment ago and about to
         // die on a permission error, so the line went green on every spawn and
         // a machine without the right watched it alternate every five minutes.
-        let alive: Vec<&Capture> = captures.values().filter(|c| c.opened.load(Ordering::Relaxed) && !c.handle.is_finished()).collect();
+        let alive: Vec<&Capture> = captures
+            .values()
+            .filter(|c| c.opened.load(Ordering::Relaxed) && !c.handle.is_finished())
+            .collect();
         if !alive.is_empty() {
-            let dropped = alive.iter().map(|c| c.dropped.load(Ordering::Relaxed)).sum();
+            let dropped = alive
+                .iter()
+                .map(|c| c.dropped.load(Ordering::Relaxed))
+                .sum();
             let mut ifaces: Vec<&str> = alive.iter().map(|c| c.iface.as_str()).collect();
             ifaces.sort_unstable();
             let iface = ifaces.join(" + ");
-            let packets: u32 = alive.iter().map(|c| c.packets.load(Ordering::Relaxed)).sum();
+            let packets: u32 = alive
+                .iter()
+                .map(|c| c.packets.load(Ordering::Relaxed))
+                .sum();
 
             // Capturing and hearing anything are different states, and on the
             // status line they looked the same. Players have reported this as
@@ -814,9 +909,8 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                 // it came back; a later relapse is worth another line
                 deaf_said = None;
             }
-            let silent = running
-                && heard == 0
-                && alive.iter().any(|c| c.started.elapsed() >= DEAF_AFTER);
+            let silent =
+                running && heard == 0 && alive.iter().any(|c| c.started.elapsed() >= DEAF_AFTER);
             let encrypted: u32 = alive.iter().map(|c| c.tls.load(Ordering::Relaxed)).sum();
             let deaf = match (silent, packets > 0 && encrypted == packets, wide_capture()) {
                 (false, _, _) => Deaf::No,
@@ -848,7 +942,16 @@ fn watcher(stats: Arc<Mutex<GameStats>>, status: Arc<Mutex<Status>>, app: tauri:
                     }
                 ));
             }
-            set_status(&status, Status::Capturing { iface, hosts, dropped, packets, deaf });
+            set_status(
+                &status,
+                Status::Capturing {
+                    iface,
+                    hosts,
+                    dropped,
+                    packets,
+                    deaf,
+                },
+            );
         } else if !captures.is_empty() {
             // every capture died: whatever they stored stands
         } else if !running {
@@ -875,7 +978,10 @@ fn capture_loop(
     opened: Arc<AtomicBool>,
     app: &tauri::AppHandle,
 ) -> Result<(), pcap::Error> {
-    let mut cap = pcap::Capture::from_device(dev)?.immediate_mode(true).timeout(400).open()?;
+    let mut cap = pcap::Capture::from_device(dev)?
+        .immediate_mode(true)
+        .timeout(400)
+        .open()?;
     cap.filter(&format!("tcp and len > 30 and ({scope})"), true)?;
     // past every way this can fail: only now is it a capture
     opened.store(true, Ordering::Relaxed);
@@ -892,7 +998,10 @@ fn capture_loop(
             if let Ok(st) = cap.stats() {
                 dropped.store(st.dropped + st.if_dropped, Ordering::Relaxed);
                 #[cfg(debug_assertions)]
-                println!("[capture] {} packets seen, {} dropped, {} dropped by the adapter", st.received, st.dropped, st.if_dropped);
+                println!(
+                    "[capture] {} packets seen, {} dropped, {} dropped by the adapter",
+                    st.received, st.dropped, st.if_dropped
+                );
             }
         }
         let packet = match cap.next_packet() {
@@ -920,7 +1029,9 @@ fn capture_loop(
         // A segmentation-offloading adapter hands us the whole buffer with a
         // length field describing one segment of it; `unoffload` puts the two
         // back in agreement, and returns nothing at all in the ordinary case.
-        let patched = whole.then(|| ip_offset(data, framing).and_then(|at| unoffload(data, at))).flatten();
+        let patched = whole
+            .then(|| ip_offset(data, framing).and_then(|at| unoffload(data, at)))
+            .flatten();
         let data: &[u8] = patched.as_deref().unwrap_or(data);
         let sliced = match framing {
             1 => SlicedPacket::from_ethernet(data), // DLT_EN10MB
@@ -992,7 +1103,13 @@ fn fresh_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn handle_flush(flushed: &[u8], src: IpAddr, stats: &Arc<Mutex<GameStats>>, hits: &Arc<AtomicU32>, app: &tauri::AppHandle) {
+fn handle_flush(
+    flushed: &[u8],
+    src: IpAddr,
+    stats: &Arc<Mutex<GameStats>>,
+    hits: &Arc<AtomicU32>,
+    app: &tauri::AppHandle,
+) {
     let messages = fresh_messages(parser::extract_messages(flushed));
     if messages.is_empty() {
         return;
@@ -1068,7 +1185,16 @@ mod tests {
         for real in ["enp9s0", "eth0", "wlan0", "virbr0", "tun0", "wg0"] {
             assert!(is_a_network(real), "{real}");
         }
-        for pseudo in ["any", "nflog", "nfqueue", "dbus-system", "dbus-session", "bluetooth0", "bluetooth-monitor", "usbmon1"] {
+        for pseudo in [
+            "any",
+            "nflog",
+            "nfqueue",
+            "dbus-system",
+            "dbus-session",
+            "bluetooth0",
+            "bluetooth-monitor",
+            "usbmon1",
+        ] {
             assert!(!is_a_network(pseudo), "{pseudo}");
         }
     }
@@ -1082,10 +1208,19 @@ mod tests {
     /// the game could have been seen on.
     #[test]
     fn an_adapter_with_no_addresses_is_still_worth_listening_on() {
-        assert!(worth_capturing(&[]), "no addresses is not the same as loopback");
+        assert!(
+            worth_capturing(&[]),
+            "no addresses is not the same as loopback"
+        );
         assert!(worth_capturing(&[address("192.168.0.70")]));
-        assert!(worth_capturing(&[address("127.0.0.1"), address("10.250.0.1")]));
-        assert!(!worth_capturing(&[address("127.0.0.1")]), "loopback is what this skips");
+        assert!(worth_capturing(&[
+            address("127.0.0.1"),
+            address("10.250.0.1")
+        ]));
+        assert!(
+            !worth_capturing(&[address("127.0.0.1")]),
+            "loopback is what this skips"
+        );
         assert!(!worth_capturing(&[address("::1")]));
     }
 
@@ -1108,10 +1243,18 @@ mod tests {
     /// When they differ the old filter matched nothing at all, silently.
     #[test]
     fn the_filter_names_the_far_end_and_leaves_this_machine_alone() {
-        let remote: BTreeSet<IpAddr> = ["172.104.128.178".parse().unwrap(), "139.162.166.201".parse().unwrap()].into_iter().collect();
+        let remote: BTreeSet<IpAddr> = [
+            "172.104.128.178".parse().unwrap(),
+            "139.162.166.201".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
         let filter = scope_for(&remote);
 
-        assert_eq!(filter, "net 139.162.166.0/24 or net 172.104.128.0/24", "the game's servers and their neighbours, and nothing else");
+        assert_eq!(
+            filter, "net 139.162.166.0/24 or net 172.104.128.0/24",
+            "the game's servers and their neighbours, and nothing else"
+        );
 
         // the concern that put the far side there in the first place
         assert!(!filter.contains("192.168.0.226"));
@@ -1120,7 +1263,12 @@ mod tests {
 
         // Two servers in one range are one clause, so a third joining it is
         // already covered without waiting for the endpoints to be re-read.
-        let pair: BTreeSet<IpAddr> = ["172.104.128.178".parse().unwrap(), "172.104.128.9".parse().unwrap()].into_iter().collect();
+        let pair: BTreeSet<IpAddr> = [
+            "172.104.128.178".parse().unwrap(),
+            "172.104.128.9".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(scope_for(&pair), "net 172.104.128.0/24");
     }
 }
@@ -1166,8 +1314,16 @@ mod offload_tests {
         // was handled, the first was dropped by the parser and the second came
         // back one segment long, which is why a 5 KB character save — the only
         // carrier of experience and kills — never arrived on such a machine.
-        assert_eq!(payload_seen(&frame(5000, 0)), Some(5000), "a header claiming nothing");
-        assert_eq!(payload_seen(&frame(5000, 1500)), Some(5000), "a header claiming one segment");
+        assert_eq!(
+            payload_seen(&frame(5000, 0)),
+            Some(5000),
+            "a header claiming nothing"
+        );
+        assert_eq!(
+            payload_seen(&frame(5000, 1500)),
+            Some(5000),
+            "a header claiming one segment"
+        );
     }
 
     #[test]
@@ -1187,13 +1343,19 @@ mod offload_tests {
         let mut f = frame(0, 40);
         f.resize(60, 0);
         assert_eq!(f.len(), 60);
-        assert!(unoffload(&f, 14).is_none(), "padding is not an offloaded buffer");
+        assert!(
+            unoffload(&f, 14).is_none(),
+            "padding is not an offloaded buffer"
+        );
         assert_eq!(payload_seen(&f), Some(0));
 
         // one byte past the ceiling there is no padding to excuse the overshoot
         let mut big = frame(0, 40);
         big.resize(61, 0);
-        assert!(unoffload(&big, 14).is_some(), "and it is read as offloaded again");
+        assert!(
+            unoffload(&big, 14).is_some(),
+            "and it is read as offloaded again"
+        );
     }
 
     #[test]

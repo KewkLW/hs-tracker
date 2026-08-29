@@ -42,7 +42,12 @@ const IN_FLIGHT: Duration = Duration::from_secs(15);
 const IDLE_AFTER: Duration = Duration::from_secs(300);
 
 // stack resources by item type
-const RESOURCES: &[(i64, &str)] = &[(12, "keys"), (13, "collectibles"), (14, "materials"), (15, "socketables")];
+const RESOURCES: &[(i64, &str)] = &[
+    (12, "keys"),
+    (13, "collectibles"),
+    (14, "materials"),
+    (15, "socketables"),
+];
 
 /// What a character wears and carries: helmets through charms, vials, and orbs.
 /// The grade counters are about gear and nothing else — a key or a reagent has
@@ -55,6 +60,43 @@ const RESOURCES: &[(i64, &str)] = &[(12, "keys"), (13, "collectibles"), (14, "ma
 /// gap. Every Heroic item in the tables is graded SS, so a Heroic that is not
 /// an SS could never have been anything but this.
 const GEAR: [i64; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 18];
+
+/// The weakest variable roll on a named item, independent of the user's alert
+/// threshold. The game sends the exact values only with the pickup; the ranges
+/// come from the same numeric stat table that creates its tooltip.
+fn roll_floor_percent(
+    item_type: i64,
+    item_id: i64,
+    weapon_type: i64,
+    name: &str,
+    rolls: &crate::parser::ItemRolls,
+) -> Option<u8> {
+    if name.is_empty() || rolls.values.is_empty() {
+        return None;
+    }
+    let ranges = crate::item_rolls::ranges(item_type, item_id, weapon_type)?;
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut floor = 1.0_f64;
+    for range in ranges {
+        let value = rolls
+            .values
+            .binary_search_by_key(&range.id, |(id, _)| *id)
+            .ok()
+            .map(|i| rolls.values[i].1)?;
+        // A missing or out-of-range component means the packet and the static
+        // identity disagree. Failing closed is safer than blessing the wrong
+        // item because one coincidental number happened to look excellent.
+        const EPSILON: f64 = 1e-9;
+        if !value.is_finite() || value < range.min - EPSILON || value > range.max + EPSILON {
+            return None;
+        }
+        let quality = (value - range.min) / (range.max - range.min);
+        floor = floor.min(quality);
+    }
+    Some((floor.clamp(0.0, 1.0) * 100.0 + 1e-7).floor() as u8)
+}
 
 /// Containers, which carry a real rarity and are worth keeping in the tables —
 /// the game shows an Angelic Vault in gold and a Superior one in blue — but
@@ -99,11 +141,23 @@ pub const TALLIES: &[(&str, &str, &str)] = &[
     ("statisticuberamunrakills", "Uber Amun Ra", "boss"),
     ("statisticuberarchitectkills", "Uber Architect", "boss"),
     ("statisticuberpapalegbakills", "Uber Papa Legba", "boss"),
-    ("statisticubercaptaingrimtidekills", "Uber Captain Grimtide", "boss"),
+    (
+        "statisticubercaptaingrimtidekills",
+        "Uber Captain Grimtide",
+        "boss",
+    ),
     ("statisticuberbloodmaidenkills", "Uber Blood Maiden", "boss"),
-    ("statisticuberphantomleviathankills", "Uber Phantom Leviathan", "boss"),
+    (
+        "statisticuberphantomleviathankills",
+        "Uber Phantom Leviathan",
+        "boss",
+    ),
     ("statisticuberchaostowerkills", "Uber Chaos Tower", "boss"),
-    ("statisticchaostowerfloorclears", "Chaos Tower floors", "boss"),
+    (
+        "statisticchaostowerfloorclears",
+        "Chaos Tower floors",
+        "boss",
+    ),
     ("statisticwormholeclears", "Wormholes", "boss"),
     ("statisticcommonchestsopened", "Common", "chest"),
     ("statisticrarechestopened", "Rare", "chest"),
@@ -125,7 +179,12 @@ pub struct TallyCount {
 /// level-100 runes. Override the whole list in settings.json if the game
 /// regrades anything.
 pub fn default_notable() -> Vec<(String, Vec<String>)> {
-    let group = |label: &str, names: &[&str]| (label.to_string(), names.iter().map(|n| n.to_lowercase()).collect());
+    let group = |label: &str, names: &[&str]| {
+        (
+            label.to_string(),
+            names.iter().map(|n| n.to_lowercase()).collect(),
+        )
+    };
     vec![
         group("Angelic Key", &["Angelic Key"]),
         group("Satanic Dice", &["Satanic Dice"]),
@@ -133,7 +192,10 @@ pub fn default_notable() -> Vec<(String, Vec<String>)> {
         // Sus, Kek and Jord came with the 2026-08-21 patch. "Satanic Key" used
         // to sit above these and has been dropped: no item in the game carries
         // that name, so the counter could never move.
-        group("SS runes", &["Fawn", "Flo", "Nju", "Jol", "Sus", "Kek", "Jord"]),
+        group(
+            "SS runes",
+            &["Fawn", "Flo", "Nju", "Jol", "Sus", "Kek", "Jord"],
+        ),
     ]
 }
 
@@ -146,7 +208,10 @@ const JOURNAL_CAP: usize = 400;
 const SERIES_CAP: usize = 4000;
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -160,6 +225,34 @@ pub struct SatanicZone {
     pub zone: String,
     pub buffs: Vec<u8>,
     pub debuffs: Vec<u8>,
+    /// This outdoor zone owns a native Colossal Chest. Kept on the zone itself
+    /// so the snapshot, chime and flourish all answer from the same decision.
+    pub colossal_chest: bool,
+}
+
+/// The six outdoor zones whose map definition includes a native Colossal
+/// Chest. Satanic-zone codes have used all three prefixes across game patches;
+/// the numeric act/area pair is the stable part.
+fn is_colossal_chest_zone(raw: &str) -> bool {
+    let mut parts = raw.split('_');
+    let prefix = parts.next().unwrap_or_default();
+    if !["Act", "SZ", "Satanic"]
+        .iter()
+        .any(|known| prefix.eq_ignore_ascii_case(known))
+    {
+        return false;
+    }
+    let act = parts.next().and_then(|n| n.parse::<u8>().ok());
+    let area = parts.next().and_then(|n| n.parse::<u8>().ok());
+    matches!(
+        (act, area),
+        (Some(1), Some(5))  // King's Garden
+            | (Some(3), Some(3)) // Mos'Arathim Desert
+            | (Some(3), Some(4)) // Pyramid Level 1
+            | (Some(4), Some(3)) // Corrupted Cave
+            | (Some(5), Some(2)) // Misty Swamp
+            | (Some(6), Some(4)) // Steam Train
+    )
 }
 
 /// The same ids in any order. Short lists — three or four — so sorting two
@@ -210,6 +303,97 @@ pub struct DropEntry {
     pub announce: bool,
     /// passed the flourish's own rules, which are a different question
     pub flourish: bool,
+    /// Every variable stat on this named item met the configured roll floor.
+    /// Exact values arrive on pickup, so this may be a visual-only follow-up to
+    /// the ordinary ground notification.
+    pub high_roll: bool,
+    /// The weakest variable roll, as a whole percentage. Present only on the
+    /// high-roll flourish; useful both to label it and to explain why it fired.
+    pub roll_percent: Option<u8>,
+    /// Every enabled custom stat rule this pickup satisfied. Several rules are
+    /// folded into one special announcement so a single item can never make a
+    /// wall of overlapping flourishes.
+    pub stat_matches: Vec<StatAlertMatch>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StatAlertMatch {
+    pub rule_id: String,
+    pub stat: String,
+    pub stat_id: u16,
+    pub actual: f64,
+    pub op: String,
+    pub target: f64,
+}
+
+/// One persisted custom comparison. `stat` is the stable semantic key shown by
+/// the catalog; `stat_id` is the exact numeric key the current season sends.
+/// Keeping both lets a regenerated catalog migrate the number without making
+/// an old rule unreadable in the meantime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatAlertRule {
+    pub id: String,
+    pub enabled: bool,
+    pub stat: String,
+    pub stat_id: Option<u16>,
+    pub op: String,
+    pub value: f64,
+}
+
+impl Default for StatAlertRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            stat: String::new(),
+            stat_id: None,
+            op: "=".into(),
+            value: 0.0,
+        }
+    }
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    // Only absorb JSON/HTML floating-point representation noise. At a billion
+    // this tolerance is one thousandth, so adjacent integer stat values can
+    // never become "equal" merely because the numbers are large.
+    (left - right).abs() <= scale * 1e-12
+}
+
+fn matching_stat_rules(
+    rules: &[StatAlertRule],
+    rolls: &crate::parser::ItemRolls,
+) -> Vec<StatAlertMatch> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            if !rule.enabled || !rule.value.is_finite() {
+                return None;
+            }
+            let stat_id = rule.stat_id?;
+            let index = rolls
+                .values
+                .binary_search_by_key(&stat_id, |(id, _)| *id)
+                .ok()?;
+            let actual = rolls.values[index].1;
+            let (op, matched) = match rule.op.as_str() {
+                "=" | "eq" => ("=", approximately_equal(actual, rule.value)),
+                ">" | "gt" => (">", actual > rule.value),
+                "<" | "lt" => ("<", actual < rule.value),
+                _ => return None,
+            };
+            matched.then(|| StatAlertMatch {
+                rule_id: rule.id.clone(),
+                stat: rule.stat.clone(),
+                stat_id,
+                actual,
+                op: op.into(),
+                target: rule.value,
+            })
+        })
+        .collect()
 }
 
 /// How many of a run's finds are kept with it. A long farm can drop hundreds;
@@ -437,6 +621,14 @@ pub struct GameStats {
     /// items already announced, by identity — the roll on the ground and the
     /// pickup that follows are two sightings of one item
     told: std::collections::HashSet<String>,
+    /// Items whose exact pickup rolls have already earned the special visual.
+    /// This is deliberately separate from `told`: the ordinary alert normally
+    /// happens on the ground, before the values needed for this check exist.
+    high_roll_told: std::collections::HashSet<String>,
+    /// Custom stat-rule follow-ups are independent of both the ordinary alert
+    /// and high-roll scoring. One item may satisfy several rows, but it earns
+    /// one combined follow-up for all of them.
+    stat_alert_told: std::collections::HashSet<String>,
     /// Fingerprints the player has just let go of; see `GameEvent::ItemsLetGo`.
     ///
     /// An entry is spent the moment it is used: an item can only come back once
@@ -484,11 +676,14 @@ pub struct Prefs {
     pub fx_tier: i64,
     /// announce anything the custom filter's lists match, whatever its rarity
     pub fx_listed: bool,
+    pub high_roll_enabled: bool,
+    pub high_roll_threshold: u8,
+    pub stat_alert_rules: Vec<StatAlertRule>,
     pub notable_defs: Vec<(String, Vec<String>)>,
     /// (sound key, item names) — an item on one of these is announced by it
     pub sound_lists: Vec<(String, Vec<String>)>,
-    /// Satanic zone buffs worth an alert. Empty means every rotation — see
-    /// `take_zone_change`.
+    /// Satanic zone buffs worth an ordinary alert. Empty means every rotation;
+    /// native Colossal Chest zones bypass the list — see `take_zone_change`.
     pub zone_buffs: Vec<u8>,
 }
 
@@ -501,6 +696,9 @@ impl Default for Prefs {
             fx_rarities: Vec::new(),
             fx_tier: 6,
             fx_listed: false,
+            high_roll_enabled: true,
+            high_roll_threshold: 75,
+            stat_alert_rules: Vec::new(),
             notable_defs: default_notable(),
             sound_lists: Vec::new(),
             // every rotation, until the player narrows it
@@ -528,7 +726,10 @@ impl Default for GameStats {
             xp_earned: 0,
             total_kills: 0,
             kills_earned: 0,
-            items: RARITIES.iter().map(|(_, name)| (*name, ItemCount::default())).collect(),
+            items: RARITIES
+                .iter()
+                .map(|(_, name)| (*name, ItemCount::default()))
+                .collect(),
             graded: HashMap::new(),
             tally_base: HashMap::new(),
             tally_earned: HashMap::new(),
@@ -562,6 +763,8 @@ impl Default for GameStats {
             tier_seen: HashMap::new(),
             counted: std::collections::HashSet::new(),
             told: std::collections::HashSet::new(),
+            high_roll_told: std::collections::HashSet::new(),
+            stat_alert_told: std::collections::HashSet::new(),
             let_go: std::collections::HashSet::new(),
             account: None,
             announced_at: HashMap::new(),
@@ -773,7 +976,8 @@ impl GameStats {
                 name: mark.name.clone(),
                 level: mark.level,
                 herolevel: mark.herolevel,
-                elapsed_secs: mark.accumulated_secs + self.active().as_secs().saturating_sub(mark.since_secs),
+                elapsed_secs: mark.accumulated_secs
+                    + self.active().as_secs().saturating_sub(mark.since_secs),
                 partial: mark.partial,
             }),
         }
@@ -873,11 +1077,14 @@ impl GameStats {
     /// An empty pick is not "nothing", it is every rotation. The list narrows
     /// the alert, and a player who has narrowed it to nothing has narrowed
     /// nothing. Reading it the other way makes the picker's own "clear" button
-    /// a mute switch that nothing on the page admits to.
+    /// a mute switch that nothing on the page admits to. A native Colossal Chest
+    /// zone is the deliberate exception: catching those six rotations is useful
+    /// independent of their rolled buffs, so they always pass this gate.
     pub fn take_zone_change(&mut self) -> Option<SatanicZone> {
         let zone = self.sz_changed.take().and_then(|_| self.satanic.clone())?;
         let wanted = &self.prefs.zone_buffs;
-        (wanted.is_empty() || zone.buffs.iter().any(|b| wanted.contains(b))).then_some(zone)
+        (zone.colossal_chest || wanted.is_empty() || zone.buffs.iter().any(|b| wanted.contains(b)))
+            .then_some(zone)
     }
 
     /// Add the time spent in the current room to its total and start counting
@@ -907,11 +1114,16 @@ impl GameStats {
     pub fn finish(&mut self) -> Option<Run> {
         self.bank_room_time();
         let secs = self.active().as_secs();
-        let nothing_happened = self.gold_earned == 0 && self.xp_earned == 0 && self.kills_earned == 0;
+        let nothing_happened =
+            self.gold_earned == 0 && self.xp_earned == 0 && self.kills_earned == 0;
         if secs < 60 || nothing_happened {
             return None;
         }
-        let mut zones: Vec<(String, u64)> = self.zone_time.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut zones: Vec<(String, u64)> = self
+            .zone_time
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         zones.sort_by_key(|(_, secs)| std::cmp::Reverse(*secs));
         zones.truncate(6);
         // the finds, newest first, and only the ones that were worth announcing
@@ -945,7 +1157,11 @@ impl GameStats {
             xp: self.xp_earned,
             xp_in_level: self.xp_authoritative.then_some(self.total_xp.max(0)),
             kills: self.kills_earned,
-            items: self.items.iter().map(|(name, c)| (name.to_string(), c.total)).collect(),
+            items: self
+                .items
+                .iter()
+                .map(|(name, c)| (name.to_string(), c.total))
+                .collect(),
             notable,
             zones,
             tallies: self.tallies(),
@@ -1063,7 +1279,11 @@ impl GameStats {
             return None;
         }
         let lower = name.to_lowercase();
-        self.prefs.sound_lists.iter().find(|(_, names)| names.contains(&lower)).map(|(key, _)| key.clone())
+        self.prefs
+            .sound_lists
+            .iter()
+            .find(|(_, names)| names.contains(&lower))
+            .map(|(key, _)| key.clone())
     }
 
     /// Every setting at once.
@@ -1107,7 +1327,15 @@ impl GameStats {
     #[cfg(test)]
     pub fn set_sound_lists(&mut self, lists: Vec<(String, Vec<String>)>) {
         self.revision += 1;
-        self.prefs.sound_lists = lists.into_iter().map(|(key, names)| (key, names.into_iter().map(|n| n.trim().to_lowercase()).collect())).collect();
+        self.prefs.sound_lists = lists
+            .into_iter()
+            .map(|(key, names)| {
+                (
+                    key,
+                    names.into_iter().map(|n| n.trim().to_lowercase()).collect(),
+                )
+            })
+            .collect();
     }
 
     fn count_notable(&mut self, name: &str, amount: i64) {
@@ -1121,7 +1349,11 @@ impl GameStats {
             .prefs
             .notable_defs
             .iter()
-            .find(|(_, names)| names.iter().any(|n| *n == lower || n.trim_end_matches(" rune") == bare))
+            .find(|(_, names)| {
+                names
+                    .iter()
+                    .any(|n| *n == lower || n.trim_end_matches(" rune") == bare)
+            })
             .map(|(label, _)| label.clone());
         if let Some(label) = label {
             *self.notable.entry(label).or_insert(0) += amount;
@@ -1202,6 +1434,7 @@ impl GameStats {
                     fingerprint: format!("chat:{}:{}", name.to_lowercase(), now_ms()),
                     hash: String::new(),
                     ground: false,
+                    rolls: Default::default(),
                 });
             }
             GameEvent::Gold(c) => self.apply_currency(c),
@@ -1242,7 +1475,9 @@ impl GameStats {
                 // which is exactly what the tracker does on its first save of a
                 // run — the same path, for the same reason. Nothing is credited
                 // by the packet that re-anchors.
-                let switched = *has_experience && !name.is_empty() && self.baseline_for.as_deref().is_some_and(|had| had != name);
+                let switched = *has_experience
+                    && !name.is_empty()
+                    && self.baseline_for.as_deref().is_some_and(|had| had != name);
                 if switched {
                     self.stale_save = true;
                     self.xp_authoritative = false;
@@ -1439,7 +1674,12 @@ impl GameStats {
                     self.room = Some(room.clone());
                 }
             }
-            GameEvent::Vitals { mf, level, hlevel, satanic_here } => {
+            GameEvent::Vitals {
+                mf,
+                level,
+                hlevel,
+                satanic_here,
+            } => {
                 // What the packet did not state is left where it was. The
                 // client files crash reports carrying the same shape with no
                 // magic find in them, and taking those as zero left the number
@@ -1482,6 +1722,7 @@ impl GameStats {
                 fingerprint,
                 hash,
                 ground,
+                rolls,
             } => {
                 // One item is seen twice: when the server rolls it and when it
                 // lands in the bag. Its own hash ties the two together, so it
@@ -1534,9 +1775,10 @@ impl GameStats {
                 // of gear looks like from the outside.
                 //
                 // Nothing is refused until the client has said who it is.
-                if let (Some(mine), Some(theirs)) =
-                    (self.account.as_deref(), crate::parser::fingerprint_account(fingerprint))
-                {
+                if let (Some(mine), Some(theirs)) = (
+                    self.account.as_deref(),
+                    crate::parser::fingerprint_account(fingerprint),
+                ) {
                     if mine != theirs {
                         return None;
                     }
@@ -1551,6 +1793,8 @@ impl GameStats {
                         self.seen_fingerprints.clear();
                         self.counted.clear();
                         self.told.clear();
+                        self.high_roll_told.clear();
+                        self.stat_alert_told.clear();
                     }
                 }
                 let first = identity.is_empty() || self.counted.insert(identity.clone());
@@ -1578,7 +1822,24 @@ impl GameStats {
                     }
                 }
                 let rarity_key = crate::parser::resolve_rarity(rarity, name, *unscaled);
-                let is_resource = RESOURCES.iter().any(|(t, _)| t == item_type) || is_container(name);
+                let is_resource =
+                    RESOURCES.iter().any(|(t, _)| t == item_type) || is_container(name);
+                let roll_percent = (!*ground
+                    && GEAR.contains(item_type)
+                    && self.prefs.high_roll_enabled)
+                    .then(|| roll_floor_percent(*item_type, *item_id, *weapon_type, name, rolls))
+                    .flatten();
+                let fresh_high_roll = roll_percent
+                    .is_some_and(|percent| percent >= self.prefs.high_roll_threshold)
+                    && (identity.is_empty() || self.high_roll_told.insert(identity.clone()));
+                let stat_matches = if *ground {
+                    Vec::new()
+                } else {
+                    matching_stat_rules(&self.prefs.stat_alert_rules, rolls)
+                };
+                let fresh_stat_alert = !stat_matches.is_empty()
+                    && (identity.is_empty() || self.stat_alert_told.insert(identity.clone()));
+                let special = fresh_high_roll || fresh_stat_alert;
                 // A sighting counts once, whichever of the two got here first:
                 // `counted` is keyed on the item's identity, not on how it was
                 // seen. So a roll on the floor does reach the counters — an
@@ -1612,10 +1873,11 @@ impl GameStats {
                     self.count_notable(name, n);
                     self.progressed();
                 }
-                // One notification per item: either when it hits the ground or
-                // when it lands in the bag, never both. That is what `told`
-                // below is for, and it is enough on its own — an item is
-                // announced by whichever sighting gets here first and passes.
+                // One ORDINARY notification per item: either when it hits the
+                // ground or when it lands in the bag, never both. That is what
+                // `told` below is for. Verified roll visuals are the deliberate
+                // exception, because their values do not exist in the ground
+                // packet; they are deduped by their own identity sets.
                 //
                 // So preferring the drop moment means preferring it, not
                 // requiring it. Requiring it is what this used to do, and since
@@ -1638,9 +1900,11 @@ impl GameStats {
                 let listed = self.listed_sound(name);
                 let listed_hit = listed.is_some();
                 let wanted = *announced || listed_hit || self.prefs.prefer_ground || !*ground;
-                let announce = *announced || listed_hit || (!is_resource && self.passes_filter(&rarity_key, tier));
+                let announce = *announced
+                    || listed_hit
+                    || (!is_resource && self.passes_filter(&rarity_key, tier));
                 let flourish = !is_resource && self.worth_a_flourish(&rarity_key, tier, listed_hit);
-                if wanted && (announce || flourish) {
+                if wanted && (announce || flourish || special) {
                     // One item, one notification, whichever sighting got here
                     // first. The rule above says as much, but a list was
                     // exempt from it — `wanted` is true for a listed item
@@ -1648,43 +1912,88 @@ impl GameStats {
                     // as it hit the ground and again as it went in the bag.
                     // The exemption was meant to outrank the rarity switches,
                     // which is what `announce` already does.
-                    if !identity.is_empty() && !self.told.insert(identity.clone()) {
-                        return None;
+                    let untold = identity.is_empty() || self.told.insert(identity.clone());
+                    if untold {
+                        // The server announces a notable find in chat the moment
+                        // it drops — the only signal that arrives before the item
+                        // is picked up and says what it is. The local drop and the
+                        // pickup that follow stay silent so it chimes once.
+                        let lower = name.to_lowercase();
+                        let echo = self
+                            .announced_at
+                            .get(&lower)
+                            .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                        if *announced {
+                            self.announced_at.insert(lower, Instant::now());
+                            self.announced_at
+                                .retain(|_, t| t.elapsed() < Duration::from_secs(120));
+                        }
+                        // A chat echo suppresses the ordinary notification, but
+                        // not a newly verified roll alert. Exact values were not
+                        // in the chat line, so the pickup is new information.
+                        if *announced || !echo {
+                            // Only what the alert rules asked for chimes. A drop
+                            // that got this far on the flourish's rules alone is
+                            // a picture, not a sound. A roll-alert follow-up is
+                            // also visual-only when the ground already chimed.
+                            let sound = if echo || !announce {
+                                None
+                            } else {
+                                listed.or_else(|| {
+                                    self.prefs
+                                        .alerts
+                                        .contains(&rarity_key)
+                                        .then(|| rarity_key.to_lowercase())
+                                })
+                            };
+                            let entry = DropEntry {
+                                ts_ms: now_ms(),
+                                sound,
+                                rarity: rarity_key,
+                                ground: *ground,
+                                mf: *mf,
+                                tier,
+                                item_type: *item_type,
+                                item_id: *item_id,
+                                weapon_type: *weapon_type,
+                                seed: *seed,
+                                name: name.clone(),
+                                announced: *announced,
+                                zone: self.satanic.as_ref().map(|s| s.zone.clone()),
+                                room: self.room.clone(),
+                                announce,
+                                flourish: flourish || special,
+                                high_roll: fresh_high_roll,
+                                roll_percent: roll_percent.filter(|_| fresh_high_roll),
+                                stat_matches: if fresh_stat_alert {
+                                    stat_matches.clone()
+                                } else {
+                                    Vec::new()
+                                },
+                            };
+                            // the journal is the alert rules' list; a drop that
+                            // only earned a flourish does not belong in it
+                            if announce {
+                                if self.drops.len() >= JOURNAL_CAP {
+                                    self.drops.pop_front();
+                                }
+                                self.drops.push_back(entry.clone());
+                                self.extra_rev += 1;
+                            }
+                            return Some(entry);
+                        }
                     }
-                    // The server announces a notable find in chat the moment
-                    // it drops — the only signal that arrives before the item
-                    // is picked up and says what it is. The local drop and the
-                    // pickup that follow stay silent so it chimes once.
-                    let lower = name.to_lowercase();
-                    let echo = self.announced_at.get(&lower).is_some_and(|t| t.elapsed() < Duration::from_secs(60));
-                    if *announced {
-                        self.announced_at.insert(lower, Instant::now());
-                        self.announced_at.retain(|_, t| t.elapsed() < Duration::from_secs(120));
-                    } else if echo {
-                        // The server's chat line and the client's own sighting
-                        // of the same drop are one find. Only the chime was
-                        // being suppressed, so the item still got a second
-                        // journal line, a second ticker row and a second entry
-                        // in the run's finds — which is what a fingerprint on
-                        // the chat event was supposed to prevent and could not,
-                        // the two sightings having no identity in common.
-                        return None;
-                    }
-                    // Only what the alert rules asked for chimes. A drop that
-                    // got this far on the flourish's rules alone is a picture,
-                    // not a sound: with the alerts set to SS and the flourish
-                    // to D, every D item was making a noise the player had
-                    // just finished switching off.
-                    let sound = if echo || !announce {
-                        None
-                    } else {
-                        listed.or_else(|| self.prefs.alerts.contains(&rarity_key).then(|| rarity_key.to_lowercase()))
-                    };
-                    let entry = DropEntry {
+                }
+                // The usual case is two sightings: the ordinary alert happened
+                // on the ground and only the pickup knows the rolls. This second
+                // entry is intentionally visual-only — no second sound, ticker,
+                // journal row or count for the same item.
+                if special {
+                    return Some(DropEntry {
                         ts_ms: now_ms(),
-                        sound,
+                        sound: None,
                         rarity: rarity_key,
-                        ground: *ground,
+                        ground: false,
                         mf: *mf,
                         tier,
                         item_type: *item_type,
@@ -1692,28 +2001,29 @@ impl GameStats {
                         weapon_type: *weapon_type,
                         seed: *seed,
                         name: name.clone(),
-                        announced: *announced,
+                        announced: false,
                         zone: self.satanic.as_ref().map(|s| s.zone.clone()),
                         room: self.room.clone(),
-                        announce,
-                        flourish,
-                    };
-                    // the journal is the alert rules' list; a drop that only
-                    // earned a flourish does not belong in it
-                    if announce {
-                        if self.drops.len() >= JOURNAL_CAP {
-                            self.drops.pop_front();
-                        }
-                        self.drops.push_back(entry.clone());
-                        self.extra_rev += 1;
-                    }
-                    return Some(entry);
+                        announce: false,
+                        flourish: true,
+                        high_roll: fresh_high_roll,
+                        roll_percent: roll_percent.filter(|_| fresh_high_roll),
+                        stat_matches: if fresh_stat_alert {
+                            stat_matches
+                        } else {
+                            Vec::new()
+                        },
+                    });
                 }
             }
             GameEvent::ZoneRegion(id) => {
                 self.zone_asked_by = Some(id.clone());
             }
-            GameEvent::SatanicZone { zone, buffs, debuffs } => {
+            GameEvent::SatanicZone {
+                zone,
+                buffs,
+                debuffs,
+            } => {
                 // A roll different from the one we are holding is the
                 // rotation; a zone where there was none is this process finding
                 // out where the zone is, which is not news the player asked to
@@ -1726,7 +2036,9 @@ impl GameStats {
                 // buffs, that is exactly the rotation the player asked to hear
                 // about. The order the server lists them in is its own business,
                 // so they are compared as sets.
-                let rerolled = |s: &SatanicZone| s.zone != *zone || !same_set(&s.buffs, buffs) || !same_set(&s.debuffs, debuffs);
+                let rerolled = |s: &SatanicZone| {
+                    s.zone != *zone || !same_set(&s.buffs, buffs) || !same_set(&s.debuffs, debuffs)
+                };
                 // Only against the zone the same region gave us. A reply for
                 // another region is a different question's answer: it replaces
                 // what we hold, because it is where the player now is, and it
@@ -1745,6 +2057,7 @@ impl GameStats {
                     zone: zone.clone(),
                     buffs: buffs.clone(),
                     debuffs: debuffs.clone(),
+                    colossal_chest: is_colossal_chest_zone(zone),
                 });
                 self.satanic_at = Some(now_ms());
             }
@@ -1764,7 +2077,10 @@ impl GameStats {
         // takes the other packet to arrive. Past that it was something else —
         // a quest paying into the bank, a sale — and it must not swallow a real
         // deposit later in the session.
-        if self.pending_since.is_some_and(|at| at.elapsed() > IN_FLIGHT) {
+        if self
+            .pending_since
+            .is_some_and(|at| at.elapsed() > IN_FLIGHT)
+        {
             self.pending_step = 0;
             self.pending_since = None;
         }
@@ -1833,7 +2149,11 @@ impl GameStats {
         // is measured against the abandoned peak, `diff` is always negative,
         // and vendor income, mail and quest gold all register as exactly zero —
         // silently, and persisted into runs.json as a run that earned nothing.
-        self.gold_high = if self.gold_mode == Some(mode) { self.gold_high.max(current) } else { current };
+        self.gold_high = if self.gold_mode == Some(mode) {
+            self.gold_high.max(current)
+        } else {
+            current
+        };
         self.gold_mode = Some(mode);
     }
 
@@ -1920,7 +2240,11 @@ impl GameStats {
             bank_age_secs: self.last_bank.map(|t| t.elapsed().as_secs()),
             carried_bank: self.stale_bank,
             carried_totals: self.stale_save,
-            resources: self.resources.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            resources: self
+                .resources
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
             notable: self
                 .prefs
                 .notable_defs
@@ -1984,7 +2308,10 @@ pub fn rarity_name(rarity: &Value) -> String {
 
 /// The currency the account plays with, as the packets name it.
 fn currency_mode(mode: &str) -> Option<&'static str> {
-    ["GSS", "GSH", "GNS", "GNH", "GBP"].iter().copied().find(|m| *m == mode)
+    ["GSS", "GSH", "GNS", "GNH", "GBP"]
+        .iter()
+        .copied()
+        .find(|m| *m == mode)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -2096,6 +2423,7 @@ mod tests {
             fingerprint: fingerprint.into(),
             hash: String::new(),
             ground: false,
+            rolls: Default::default(),
         }
     }
 
@@ -2129,6 +2457,7 @@ mod tests {
                 fingerprint,
                 hash: String::new(),
                 ground,
+                rolls: Default::default(),
             },
             other => other,
         }
@@ -2162,6 +2491,7 @@ mod tests {
             fingerprint: format!("fp-{name}"),
             hash: String::new(),
             ground: false,
+            rolls: Default::default(),
         }
     }
 
@@ -2181,6 +2511,7 @@ mod tests {
             fingerprint: String::new(),
             hash: String::new(),
             ground: true,
+            rolls: Default::default(),
         }
     }
 
@@ -2245,12 +2576,20 @@ mod tests {
         // a town belongs to its act too
         s.apply(&GameEvent::Room("Town_06_rm".into()));
         s.apply(&in_act(2));
-        assert_eq!(s.snapshot(String::new()).room, None, "towns are numbered by act");
+        assert_eq!(
+            s.snapshot(String::new()).room,
+            None,
+            "towns are numbered by act"
+        );
 
         // and a room that names no act is left alone: nothing contradicts it
         s.apply(&GameEvent::Room("Shadow_Realm_rm".into()));
         s.apply(&in_act(9));
-        assert_eq!(s.snapshot(String::new()).room.as_deref(), Some("Shadow_Realm_rm"), "the Shadow Realm belongs to no act");
+        assert_eq!(
+            s.snapshot(String::new()).room.as_deref(),
+            Some("Shadow_Realm_rm"),
+            "the Shadow Realm belongs to no act"
+        );
     }
 
     fn account_xp(season: i64, hardcore: i64, blood_pact: i64, experience: i64) -> GameEvent {
@@ -2298,7 +2637,10 @@ mod tests {
         s.set_prefer_ground(false);
         s.set_filter(vec!["Satanic".into()], 4);
         // right rarity, tier below the floor
-        assert!(s.apply(&tiered_satanic(2, "8-1-1")).is_none(), "low tier must not alert");
+        assert!(
+            s.apply(&tiered_satanic(2, "8-1-1")).is_none(),
+            "low tier must not alert"
+        );
         // right rarity and tier
         assert!(s.apply(&tiered_satanic(7, "8-2-1")).is_some());
         // filtered-out rarity
@@ -2316,7 +2658,13 @@ mod tests {
         s.apply(&notable_item("Zed", 15, 1));
         s.apply(&notable_item("Ol", 15, 1));
         let snap = s.snapshot(String::new());
-        let by = |label: &str| snap.notable.iter().find(|n| n.label == label).unwrap().total;
+        let by = |label: &str| {
+            snap.notable
+                .iter()
+                .find(|n| n.label == label)
+                .unwrap()
+                .total
+        };
         assert_eq!(by("Angelic Key"), 2);
         assert_eq!(by("SS runes"), 1, "Jol is one of the four level-100 runes");
         assert_eq!(by("S runes"), 1, "Zed is graded S");
@@ -2367,7 +2715,11 @@ mod tests {
         for _ in 0..3 {
             s.apply(&account_packet("x", 0, 0));
         }
-        assert_eq!(s.snapshot(String::new()).gold.earned, 2_600, "three saves must not turn one deposit into four");
+        assert_eq!(
+            s.snapshot(String::new()).gold.earned,
+            2_600,
+            "three saves must not turn one deposit into four"
+        );
 
         // and a genuine later deposit is still counted in full
         s.apply(&GameEvent::Gold(Currency {
@@ -2393,7 +2745,10 @@ mod tests {
         feed(&mut s, json!({"amount_gold": "2600"}));
         feed(&mut s, json!({"currencyData": {"GSS": 722_839}}));
         let snap = s.snapshot(String::new());
-        assert_eq!(snap.gold.earned, 2600, "the deposit counts, the balance does not repeat it");
+        assert_eq!(
+            snap.gold.earned, 2600,
+            "the deposit counts, the balance does not repeat it"
+        );
         assert_eq!(snap.gold.total, 722_839);
         // gold that appears without a deposit (mail, selling) still counts
         feed(&mut s, json!({"currencyData": {"GSS": 723_000}}));
@@ -2440,9 +2795,17 @@ mod tests {
         feed(&mut s, hello);
         feed(&mut s, pickup);
         let found = |s: &mut GameStats| {
-            s.snapshot(String::new()).items.get("Heroic").map(|i| i.total).unwrap_or(0)
+            s.snapshot(String::new())
+                .items
+                .get("Heroic")
+                .map(|i| i.total)
+                .unwrap_or(0)
         };
-        assert_eq!(found(&mut s), 0, "a friend handing you a thing is not you finding one");
+        assert_eq!(
+            found(&mut s),
+            0,
+            "a friend handing you a thing is not you finding one"
+        );
 
         // and another of the same kind, made for us, still is — its own roll and
         // its own hash, or the sighting it repeats would be the one above
@@ -2471,7 +2834,11 @@ mod tests {
     #[test]
     fn mail_that_was_already_there_does_not_announce_itself() {
         let mut s = GameStats::default();
-        assert_eq!(s.mail_state(), None, "before anything is said, nothing is known");
+        assert_eq!(
+            s.mail_state(),
+            None,
+            "before anything is said, nothing is known"
+        );
 
         // the server's first word, on a box that is already full
         s.apply(&GameEvent::Mail(true));
@@ -2482,12 +2849,20 @@ mod tests {
         empty.apply(&GameEvent::Mail(false));
         assert_eq!(empty.mail_state(), Some(false));
         empty.apply(&GameEvent::Mail(true));
-        assert_eq!(empty.mail_state(), Some(true), "and that is the arrival worth a chime");
+        assert_eq!(
+            empty.mail_state(),
+            Some(true),
+            "and that is the arrival worth a chime"
+        );
 
         // A Reset restarts the counters, not the account. If it forgot, the
         // next answer would look like a first one and ring again.
         s.reset();
-        assert_eq!(s.mail_state(), Some(true), "the box is not emptied by the Reset button");
+        assert_eq!(
+            s.mail_state(),
+            Some(true),
+            "the box is not emptied by the Reset button"
+        );
     }
 
     /// Picking up what you have just put down is not finding it.
@@ -2520,16 +2895,23 @@ mod tests {
             fingerprint: fp.into(),
             hash: String::new(),
             ground: false,
+            rolls: Default::default(),
         };
 
         // it leaves the bags, then comes straight back
         s.apply(&GameEvent::ItemsLetGo(vec![pendant.into()]));
-        assert!(s.apply(&pickup(pendant)).is_none(), "the same item returning is not a find");
+        assert!(
+            s.apply(&pickup(pendant)).is_none(),
+            "the same item returning is not a find"
+        );
         assert_eq!(s.snapshot(String::new()).items["Heroic"].total, 0);
 
         // and the memory is spent: put down once, back once. A second arrival
         // with that fingerprint is a real sighting again.
-        assert!(s.apply(&pickup(pendant)).is_some(), "only the return itself is excused");
+        assert!(
+            s.apply(&pickup(pendant)).is_some(),
+            "only the return itself is excused"
+        );
     }
 
     /// The same pair with a reset between them: bank the loot at the vendor,
@@ -2548,10 +2930,18 @@ mod tests {
         };
         feed(&mut s, json!({"currencyData": {"GSS": 720_239}}));
         feed(&mut s, json!({"amount_gold": "2600"}));
-        assert_eq!(s.snapshot(String::new()).gold.earned, 2600, "the finished run keeps it");
+        assert_eq!(
+            s.snapshot(String::new()).gold.earned,
+            2600,
+            "the finished run keeps it"
+        );
         s.reset();
         feed(&mut s, json!({"currencyData": {"GSS": 722_839}}));
-        assert_eq!(s.snapshot(String::new()).gold.earned, 0, "the new session did not earn it");
+        assert_eq!(
+            s.snapshot(String::new()).gold.earned,
+            0,
+            "the new session did not earn it"
+        );
     }
 
     /// The same crossing, the other way round.
@@ -2573,7 +2963,11 @@ mod tests {
         };
         feed(&mut s, json!({"currencyData": {"GSS": 720_239}}));
         feed(&mut s, json!({"currencyData": {"GSS": 722_839}}));
-        assert_eq!(s.snapshot(String::new()).gold.earned, 2600, "the balance climbed by 2600");
+        assert_eq!(
+            s.snapshot(String::new()).gold.earned,
+            2600,
+            "the balance climbed by 2600"
+        );
         s.reset();
         feed(&mut s, json!({"amount_gold": "2600"}));
         assert_eq!(
@@ -2663,7 +3057,11 @@ mod tests {
         s.apply(&notable_item("Ber", 15, 1));
         s.apply(&notable_item("Jah Rune", 15, 1));
         let snap = s.snapshot(String::new());
-        let group = snap.notable.iter().find(|n| n.label == "S runes").expect("group exists");
+        let group = snap
+            .notable
+            .iter()
+            .find(|n| n.label == "S runes")
+            .expect("group exists");
         assert_eq!(group.total, 2, "both spellings land in the same group");
     }
 
@@ -2699,11 +3097,20 @@ mod tests {
             fingerprint: String::new(),
             hash: "v".into(),
             ground: true,
+            rolls: Default::default(),
         };
         s.apply(&vial);
         let snap = s.snapshot(String::new());
-        assert_eq!(snap.items.get("Heroic").map(|i| i.total), Some(1), "a Heroic find");
-        assert_eq!(s.graded(6), 1, "and an SS one, which is what the columns disagreed about");
+        assert_eq!(
+            snap.items.get("Heroic").map(|i| i.total),
+            Some(1),
+            "a Heroic find"
+        );
+        assert_eq!(
+            s.graded(6),
+            1,
+            "and an SS one, which is what the columns disagreed about"
+        );
     }
 
     #[test]
@@ -2730,13 +3137,26 @@ mod tests {
             fingerprint: String::new(),
             hash: hash.into(),
             ground: true,
+            rolls: Default::default(),
         };
 
-        let listed = s.apply(&drop("AK-47", "a")).expect("on a list, so it is announced");
-        assert_eq!(listed.sound.as_deref(), Some("list-target"), "the list's own sound");
+        let listed = s
+            .apply(&drop("AK-47", "a"))
+            .expect("on a list, so it is announced");
+        assert_eq!(
+            listed.sound.as_deref(),
+            Some("list-target"),
+            "the list's own sound"
+        );
 
-        let plain = s.apply(&drop("Eternity", "b")).expect("on no list, but its rarity is armed");
-        assert_eq!(plain.sound.as_deref(), Some("heroic"), "still the rarity's sound");
+        let plain = s
+            .apply(&drop("Eternity", "b"))
+            .expect("on no list, but its rarity is armed");
+        assert_eq!(
+            plain.sound.as_deref(),
+            Some("heroic"),
+            "still the rarity's sound"
+        );
     }
 
     #[test]
@@ -2761,11 +3181,17 @@ mod tests {
             fingerprint: String::new(),
             hash: hash.into(),
             ground: true,
+            rolls: Default::default(),
         };
-        let listed = s.apply(&drop("AK-47", "a")).expect("a listed item is always announced");
+        let listed = s
+            .apply(&drop("AK-47", "a"))
+            .expect("a listed item is always announced");
         assert_eq!(listed.sound.as_deref(), Some("list-chase"));
         // and an item that is on no list still obeys the switches
-        assert!(s.apply(&drop("Eternity", "b")).is_none(), "unlisted items follow the filter");
+        assert!(
+            s.apply(&drop("Eternity", "b")).is_none(),
+            "unlisted items follow the filter"
+        );
 
         // the same item picked up is the same item: it chimed on the way down
         let picked = match drop("AK-47", "a") {
@@ -2798,16 +3224,23 @@ mod tests {
                 fingerprint,
                 hash,
                 ground: false,
+                rolls: Default::default(),
             },
             other => other,
         };
-        assert!(s.apply(&picked).is_none(), "a list is not told twice about one item");
+        assert!(
+            s.apply(&picked).is_none(),
+            "a list is not told twice about one item"
+        );
     }
 
     #[test]
     fn a_lone_purse_is_read_before_the_save_names_it() {
         let mut s = GameStats::default();
-        let c = Currency { gss: 753_900, ..Default::default() };
+        let c = Currency {
+            gss: 753_900,
+            ..Default::default()
+        };
         // no account packet yet: one purse has money, so it can only be that one
         s.apply(&GameEvent::Gold(c.clone()));
         assert_eq!(s.snapshot(String::new()).gold.total, 753_900);
@@ -2839,10 +3272,15 @@ mod tests {
         s.set_prefer_ground(false);
 
         // an S-grade Satanic: nothing for the alerts, everything for the window
-        let drop = s.apply(&tiered_satanic(5, "a")).expect("the flourish wants it");
+        let drop = s
+            .apply(&tiered_satanic(5, "a"))
+            .expect("the flourish wants it");
         assert!(!drop.announce, "the alert rules did not ask for this one");
         assert!(drop.flourish);
-        assert!(s.extra().drops.is_empty(), "and it does not join the journal");
+        assert!(
+            s.extra().drops.is_empty(),
+            "and it does not join the journal"
+        );
 
         // below the flourish's grade and below the alerts' — nothing at all
         assert!(s.apply(&tiered_satanic(4, "b")).is_none());
@@ -2865,10 +3303,18 @@ mod tests {
         };
 
         // the whole shard reads this line; it is not our run
-        assert!(s.apply(&found("SomebodyElse")).is_none(), "another player's luck is theirs");
-        assert!(s.extra().drops.is_empty(), "and it does not reach the journal either");
+        assert!(
+            s.apply(&found("SomebodyElse")).is_none(),
+            "another player's luck is theirs"
+        );
+        assert!(
+            s.extra().drops.is_empty(),
+            "and it does not reach the journal either"
+        );
 
-        let ours = s.apply(&found("parahryushka")).expect("our own find still counts");
+        let ours = s
+            .apply(&found("parahryushka"))
+            .expect("our own find still counts");
         assert_eq!(ours.sound.as_deref(), Some("set"));
 
         // before the first save there is nobody to be, so nothing is claimed
@@ -2885,13 +3331,17 @@ mod tests {
         s.set_flourish_filter(vec!["Satanic".into()], 1);
         s.set_prefer_ground(false);
 
-        let drop = s.apply(&tiered_satanic(1, "a")).expect("the flourish wants it");
+        let drop = s
+            .apply(&tiered_satanic(1, "a"))
+            .expect("the flourish wants it");
         assert!(drop.flourish);
         assert!(!drop.announce, "a D item is below the alerts");
         assert_eq!(drop.sound, None, "so it must not make a sound either");
 
         // the grade the tables cannot establish is still every bit of "any"
-        let unknown = s.apply(&tiered_satanic(0, "b")).expect("D means anything at all");
+        let unknown = s
+            .apply(&tiered_satanic(0, "b"))
+            .expect("D means anything at all");
         assert!(unknown.flourish);
     }
 
@@ -2906,7 +3356,9 @@ mod tests {
         // used to be copied across by hand, and this one was being dropped
         s.reset();
 
-        let drop = s.apply(&tiered_satanic(1, "a")).expect("the flourish is still armed");
+        let drop = s
+            .apply(&tiered_satanic(1, "a"))
+            .expect("the flourish is still armed");
         assert!(drop.flourish);
     }
 
@@ -2946,7 +3398,12 @@ mod tests {
             },
             other => other,
         };
-        let counted = |s: &GameStats, label: &str| s.tallies().iter().find(|t| t.label == label).map_or(0, |t| t.total);
+        let counted = |s: &GameStats, label: &str| {
+            s.tallies()
+                .iter()
+                .find(|t| t.label == label)
+                .map_or(0, |t| t.total)
+        };
 
         let mut s = GameStats::default();
         // the character arrives with a history; none of it belongs to this session
@@ -2962,7 +3419,11 @@ mod tests {
         s.reset();
         assert!(s.tallies().is_empty(), "a reset starts the tally again");
         s.apply(&save(64, 1, 380));
-        assert_eq!(counted(&s, "Satan"), 1, "and the game is not made to recount");
+        assert_eq!(
+            counted(&s, "Satan"),
+            1,
+            "and the game is not made to recount"
+        );
         assert_eq!(counted(&s, "Odin"), 0);
     }
 
@@ -2979,7 +3440,11 @@ mod tests {
         s.apply(&tiered_satanic(3, "b"));
         s.apply(&notable_item("Mystery Blade", 3, 1));
         assert_eq!(s.graded(3), 1);
-        assert_eq!(s.graded(6), 1, "an item the table cannot grade is not an SS");
+        assert_eq!(
+            s.graded(6),
+            1,
+            "an item the table cannot grade is not an SS"
+        );
         // and the overlay's chip reads the top grade, not some other one
         assert_eq!(s.snapshot(String::new()).ss, 1);
         s.reset();
@@ -3008,13 +3473,22 @@ mod tests {
             fingerprint: String::new(),
             hash: hash.into(),
             ground: true,
+            rolls: Default::default(),
         };
-        let ss = s.apply(&drop("AK-47", "a")).expect("an SS drop passes an SS filter");
+        let ss = s
+            .apply(&drop("AK-47", "a"))
+            .expect("an SS drop passes an SS filter");
         assert_eq!(ss.tier, 6);
         // a Satanic helm the table grades C — announced rarity, wrong grade
-        assert!(s.apply(&drop("Sky Crusader Helm", "b")).is_none(), "tier C is below SS");
+        assert!(
+            s.apply(&drop("Sky Crusader Helm", "b")).is_none(),
+            "tier C is below SS"
+        );
         // and an item the table does not know cannot prove SS either
-        assert!(s.apply(&drop("Mystery Blade", "c")).is_none(), "an ungraded item stays quiet");
+        assert!(
+            s.apply(&drop("Mystery Blade", "c")).is_none(),
+            "an ungraded item stays quiet"
+        );
     }
 
     #[test]
@@ -3039,6 +3513,7 @@ mod tests {
                 fingerprint: String::new(),
                 hash: String::new(),
                 ground: false,
+                rolls: Default::default(),
             })
             .expect("an announced find is always shown");
         assert_eq!(announced.rarity, "Set");
@@ -3059,8 +3534,12 @@ mod tests {
             fingerprint: "13-1-1".into(),
             hash: String::new(),
             ground: false,
+            rolls: Default::default(),
         });
-        assert!(picked.is_none_or(|d| d.sound.is_none()), "one item, one chime");
+        assert!(
+            picked.is_none_or(|d| d.sound.is_none()),
+            "one item, one chime"
+        );
     }
 
     #[test]
@@ -3082,21 +3561,30 @@ mod tests {
             fingerprint: fp.into(),
             hash: String::new(),
             ground,
+            rolls: Default::default(),
         };
 
         // alerting on the drop: rarity decides, the tier is unknown and ignored
         let mut on_drop = GameStats::default();
         on_drop.set_prefer_ground(true);
         on_drop.set_filter(vec!["Heroic".into()], 6);
-        let entry = on_drop.apply(&ak(0, true, "")).expect("the drop is announced by rarity");
+        let entry = on_drop
+            .apply(&ak(0, true, ""))
+            .expect("the drop is announced by rarity");
         assert_eq!(entry.sound.as_deref(), Some("heroic"));
 
         // alerting on the pickup: the tier is known and does its job
         let mut on_pickup = GameStats::default();
         on_pickup.set_prefer_ground(false);
         on_pickup.set_filter(vec!["Heroic".into()], 6);
-        assert!(on_pickup.apply(&ak(3, false, "3-1-1")).is_none(), "tier B is below SS");
-        assert!(on_pickup.apply(&ak(6, false, "3-1-2")).is_some(), "tier SS passes");
+        assert!(
+            on_pickup.apply(&ak(3, false, "3-1-1")).is_none(),
+            "tier B is below SS"
+        );
+        assert!(
+            on_pickup.apply(&ak(6, false, "3-1-2")).is_some(),
+            "tier SS passes"
+        );
     }
 
     #[test]
@@ -3120,6 +3608,7 @@ mod tests {
             fingerprint: String::new(),
             hash: String::new(),
             ground: true,
+            rolls: Default::default(),
         });
         let entry = entry.expect("an SS drop must be announced");
         // the packet claims Superior; the name is what decides
@@ -3151,7 +3640,10 @@ mod tests {
         // against the abandoned peak and came out negative, so gold earned read
         // exactly zero for the rest of the session.
         let mut s = GameStats::default();
-        s.apply(&GameEvent::Gold(Currency { gbp: 1_706_231, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gbp: 1_706_231,
+            ..Default::default()
+        }));
         assert_eq!(s.gold_mode, Some("GBP"), "one funded purse names itself");
 
         s.apply(&account_packet("x", 0, 0));
@@ -3229,7 +3721,12 @@ mod tests {
     #[test]
     fn gold_replays_the_currency_that_preceded_the_account() {
         let mut s = GameStats::default();
-        let gold = |g| GameEvent::Gold(Currency { gss: g, ..Default::default() });
+        let gold = |g| {
+            GameEvent::Gold(Currency {
+                gss: g,
+                ..Default::default()
+            })
+        };
         // Currency arrives before the season mode is known. One purse has money
         // and the others do not, so it is read at once; the account packet then
         // confirms the purse rather than revealing it.
@@ -3238,7 +3735,10 @@ mod tests {
 
         s.apply(&account(CURRENT_SEASON, 0, 0));
         assert_eq!(s.snapshot(String::new()).gold.total, 100);
-        assert_eq!(s.gold_earned, 0, "a balance already shown is not earned again");
+        assert_eq!(
+            s.gold_earned, 0,
+            "a balance already shown is not earned again"
+        );
         s.apply(&gold(150));
         s.apply(&gold(120));
         let snap = s.snapshot(String::new());
@@ -3280,12 +3780,295 @@ mod tests {
             fingerprint: "8-1-1".into(),
             hash: "abc".into(),
             ground,
+            rolls: Default::default(),
         };
         let dropped = s.apply(&sighting(true, 5)).expect("the roll is announced");
         assert_eq!(dropped.tier, 5);
-        assert!(s.apply(&sighting(true, 5)).is_none(), "a world sync repeats the roll");
-        assert!(s.apply(&sighting(false, 0)).is_none(), "no second alert for the pickup");
-        assert_eq!(s.snapshot(String::new()).items["Satanic"].total, 1, "counted once");
+        assert!(
+            s.apply(&sighting(true, 5)).is_none(),
+            "a world sync repeats the roll"
+        );
+        assert!(
+            s.apply(&sighting(false, 0)).is_none(),
+            "no second alert for the pickup"
+        );
+        assert_eq!(
+            s.snapshot(String::new()).items["Satanic"].total,
+            1,
+            "counted once"
+        );
+    }
+
+    #[test]
+    fn a_high_roll_pickup_gets_one_visual_follow_up_without_a_second_chime() {
+        let exact = crate::parser::ItemRolls {
+            // Gladiator's Skullet: the weakest two values are exactly 75% of
+            // the way through their static ranges.
+            values: vec![(29, 150.0), (48, 23.0), (68, 19.0), (97, 14.0), (154, 75.0)],
+            ranges: Vec::new(),
+        };
+        assert_eq!(
+            roll_floor_percent(0, 21, 0, "Gladiator's Skullet", &exact),
+            Some(75)
+        );
+
+        let sighting = |ground: bool, rolls: crate::parser::ItemRolls| GameEvent::ItemAdded {
+            rarity: json!(2),
+            unscaled: false,
+            mf: false,
+            tier: 0,
+            item_type: 0,
+            item_id: 21,
+            weapon_type: 0,
+            seed: 7_149_768,
+            name: "Gladiator's Skullet".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "10-4324110-659fe99eaae3e0003-0".into(),
+            hash: "83a617dfcfb5".into(),
+            ground,
+            rolls,
+        };
+
+        let mut s = GameStats::default();
+        s.set_flourish_filter(vec!["Set".into()], 1);
+        let ordinary = s
+            .apply(&sighting(true, Default::default()))
+            .expect("ordinary ground alert");
+        assert!(!ordinary.high_roll);
+        assert_eq!(ordinary.sound.as_deref(), Some("set"));
+
+        let special = s
+            .apply(&sighting(false, exact.clone()))
+            .expect("pickup reveals the high roll");
+        assert!(special.high_roll && special.flourish);
+        assert_eq!(special.roll_percent, Some(75));
+        assert!(
+            special.sound.is_none() && !special.announce,
+            "the follow-up is visual only"
+        );
+        assert_eq!(s.drops.len(), 1, "the pickup did not duplicate the journal");
+        assert!(
+            s.apply(&sighting(false, exact)).is_none(),
+            "the same pickup cannot retrigger it"
+        );
+    }
+
+    #[test]
+    fn the_roll_floor_is_scored_before_the_configured_threshold_is_applied() {
+        let one_low = crate::parser::ItemRolls {
+            values: vec![(29, 150.0), (48, 23.0), (68, 19.0), (97, 14.0), (154, 74.0)],
+            ranges: Vec::new(),
+        };
+        assert_eq!(
+            roll_floor_percent(0, 21, 0, "Gladiator's Skullet", &one_low),
+            Some(70)
+        );
+
+        let missing = crate::parser::ItemRolls {
+            values: vec![(29, 150.0), (48, 23.0), (68, 19.0), (154, 75.0)],
+            ranges: Vec::new(),
+        };
+        assert_eq!(
+            roll_floor_percent(0, 21, 0, "Gladiator's Skullet", &missing),
+            None
+        );
+
+        let mut s = GameStats::default();
+        s.prefs.high_roll_threshold = 71;
+        assert!(
+            roll_floor_percent(0, 21, 0, "Gladiator's Skullet", &one_low)
+                .is_some_and(|floor| floor < s.prefs.high_roll_threshold)
+        );
+        s.prefs.high_roll_threshold = 70;
+        assert!(
+            roll_floor_percent(0, 21, 0, "Gladiator's Skullet", &one_low)
+                .is_some_and(|floor| floor >= s.prefs.high_roll_threshold)
+        );
+    }
+
+    #[test]
+    fn custom_stat_rules_are_or_ed_and_keep_strict_comparisons() {
+        let rules = [
+            StatAlertRule {
+                id: "equal".into(),
+                stat: "projectile_speed".into(),
+                stat_id: Some(70),
+                op: "eq".into(),
+                value: 2.5,
+                ..Default::default()
+            },
+            StatAlertRule {
+                id: "greater".into(),
+                stat: "crushing_blow".into(),
+                stat_id: Some(97),
+                op: "gt".into(),
+                value: 12.0,
+                ..Default::default()
+            },
+            StatAlertRule {
+                id: "strict".into(),
+                stat: "vitality".into(),
+                stat_id: Some(48),
+                op: "lt".into(),
+                value: 23.0,
+                ..Default::default()
+            },
+        ];
+        let rolls = crate::parser::ItemRolls {
+            values: vec![(48, 23.0), (70, 2.5 + 1e-12), (97, 14.0)],
+            ranges: vec![(70, 1.0, 3.0)],
+        };
+        let hits = matching_stat_rules(&rules, &rolls);
+        assert_eq!(
+            hits.len(),
+            2,
+            "equality and greater-than match; strict less-than does not"
+        );
+        assert_eq!(hits[0].rule_id, "equal");
+        assert_eq!(hits[1].rule_id, "greater");
+    }
+
+    #[test]
+    fn a_custom_stat_alert_is_pickup_only_visual_and_deduped() {
+        let exact = crate::parser::ItemRolls {
+            values: vec![(29, 150.0), (48, 23.0), (68, 19.0), (97, 14.0), (154, 75.0)],
+            ranges: Vec::new(),
+        };
+        let sighting = |ground: bool, rolls: crate::parser::ItemRolls| GameEvent::ItemAdded {
+            rarity: json!(2),
+            unscaled: false,
+            mf: false,
+            tier: 0,
+            item_type: 0,
+            item_id: 21,
+            weapon_type: 0,
+            seed: 7_149_768,
+            name: "Gladiator's Skullet".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "10-stat-alert-pickup-only-0".into(),
+            hash: "stat-alert-pickup-only".into(),
+            ground,
+            rolls,
+        };
+
+        let mut s = GameStats::default();
+        s.set_filter(Vec::new(), 0);
+        s.prefs.high_roll_enabled = false;
+        s.prefs.stat_alert_rules = vec![StatAlertRule {
+            id: "enhanced-defense".into(),
+            stat: "enhanced_defense".into(),
+            stat_id: Some(29),
+            op: ">".into(),
+            value: 149.0,
+            ..Default::default()
+        }];
+
+        assert!(
+            s.apply(&sighting(true, Default::default())).is_none(),
+            "the ground packet has no exact values and the ordinary filter is silent"
+        );
+
+        let special = s
+            .apply(&sighting(false, exact.clone()))
+            .expect("the pickup's exact value satisfies the custom rule");
+        assert!(
+            special.flourish,
+            "a custom match requests the special visual"
+        );
+        assert!(
+            !special.high_roll,
+            "the qualifying high-roll values are ignored while that setting is off"
+        );
+        assert_eq!(special.roll_percent, None);
+        assert_eq!(special.stat_matches.len(), 1);
+        assert_eq!(special.stat_matches[0].rule_id, "enhanced-defense");
+        assert_eq!(special.stat_matches[0].op, ">");
+        assert!(
+            special.sound.is_none() && !special.announce,
+            "the stat follow-up is visual-only"
+        );
+        assert!(
+            s.drops.is_empty(),
+            "a visual-only match does not create a journal row"
+        );
+        assert!(
+            s.apply(&sighting(false, exact)).is_none(),
+            "the repeated pickup sighting cannot trigger the stat alert twice"
+        );
+    }
+
+    #[test]
+    fn multiple_stat_matches_and_a_high_roll_share_one_special_entry() {
+        let exact = crate::parser::ItemRolls {
+            values: vec![(29, 150.0), (48, 23.0), (68, 19.0), (97, 14.0), (154, 75.0)],
+            ranges: Vec::new(),
+        };
+        let sighting = |ground: bool, rolls: crate::parser::ItemRolls| GameEvent::ItemAdded {
+            rarity: json!(2),
+            unscaled: false,
+            mf: false,
+            tier: 0,
+            item_type: 0,
+            item_id: 21,
+            weapon_type: 0,
+            seed: 7_149_769,
+            name: "Gladiator's Skullet".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: "10-stat-alert-combined-0".into(),
+            hash: "stat-alert-combined".into(),
+            ground,
+            rolls,
+        };
+
+        let mut s = GameStats::default();
+        s.set_filter(Vec::new(), 0);
+        s.prefs.stat_alert_rules = vec![
+            StatAlertRule {
+                id: "defense-exact".into(),
+                stat: "enhanced_defense".into(),
+                stat_id: Some(29),
+                op: "=".into(),
+                value: 150.0,
+                ..Default::default()
+            },
+            StatAlertRule {
+                id: "crushing-greater".into(),
+                stat: "crushing_blow".into(),
+                stat_id: Some(97),
+                op: ">".into(),
+                value: 13.0,
+                ..Default::default()
+            },
+        ];
+
+        assert!(s.apply(&sighting(true, Default::default())).is_none());
+        let combined = s
+            .apply(&sighting(false, exact))
+            .expect("one pickup combines its high-roll and custom-stat results");
+
+        assert!(combined.flourish && combined.high_roll);
+        assert_eq!(combined.roll_percent, Some(75));
+        assert_eq!(
+            combined.stat_matches.len(),
+            2,
+            "both matching OR rules travel on the same entry"
+        );
+        assert_eq!(
+            combined
+                .stat_matches
+                .iter()
+                .map(|hit| (hit.rule_id.as_str(), hit.op.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("defense-exact", "="), ("crushing-greater", ">")]
+        );
+        assert!(combined.sound.is_none() && !combined.announce);
+        assert!(
+            s.drops.is_empty(),
+            "the combined special remains one visual-only event"
+        );
     }
 
     /// The same pair without the hash. Both sightings carry the inventory
@@ -3310,10 +4093,15 @@ mod tests {
             fingerprint: "7-4964607-65875ac569ff60006-8".into(),
             hash: String::new(),
             ground,
+            rolls: Default::default(),
         };
         s.apply(&sighting(true));
         s.apply(&sighting(false));
-        assert_eq!(s.snapshot(String::new()).items["Heroic"].total, 1, "one item, one count");
+        assert_eq!(
+            s.snapshot(String::new()).items["Heroic"].total,
+            1,
+            "one item, one count"
+        );
     }
 
     #[test]
@@ -3336,8 +4124,12 @@ mod tests {
             fingerprint: "8-1-2".into(),
             hash: "def".into(),
             ground,
+            rolls: Default::default(),
         };
-        assert!(s.apply(&sighting(true, 6)).is_none(), "alerts are set to pickup time");
+        assert!(
+            s.apply(&sighting(true, 6)).is_none(),
+            "alerts are set to pickup time"
+        );
         let picked = s.apply(&sighting(false, 0)).expect("the pickup alerts");
         assert_eq!(picked.tier, 6, "the tier came from the roll");
     }
@@ -3346,8 +4138,12 @@ mod tests {
     fn pickup_alerts_when_ground_alerts_are_off() {
         let mut s = GameStats::default();
         s.set_prefer_ground(false);
-        assert!(s.apply(&ground_item(json!(6), "Azazel's Despair", 55)).is_none());
-        assert!(s.apply(&named_item(json!(6), false, "Azazel's Despair", "8-2-1")).is_some());
+        assert!(s
+            .apply(&ground_item(json!(6), "Azazel's Despair", 55))
+            .is_none());
+        assert!(s
+            .apply(&named_item(json!(6), false, "Azazel's Despair", "8-2-1"))
+            .is_some());
     }
 
     #[test]
@@ -3376,13 +4172,25 @@ mod tests {
             hlevel: 0,
             satanic_here: Some(false),
         });
-        s.apply(&GameEvent::Gold(Currency { gss: 500, ..Default::default() }));
+        s.apply(&GameEvent::Gold(Currency {
+            gss: 500,
+            ..Default::default()
+        }));
         s.apply(&GameEvent::XpGain(15));
-        assert_eq!(s.extra_revision(), quiet, "a heartbeat adds nothing to the journal");
+        assert_eq!(
+            s.extra_revision(),
+            quiet,
+            "a heartbeat adds nothing to the journal"
+        );
         assert!(s.revision() > quiet, "the counters themselves did move");
 
-        assert!(s.apply(&named_item(json!(6), false, "Azazel's Despair", "8-9-1")).is_some());
-        assert!(s.extra_revision() > quiet, "a journalled drop is something new");
+        assert!(s
+            .apply(&named_item(json!(6), false, "Azazel's Despair", "8-9-1"))
+            .is_some());
+        assert!(
+            s.extra_revision() > quiet,
+            "a journalled drop is something new"
+        );
     }
 
     #[test]
@@ -3414,8 +4222,15 @@ mod tests {
 
         s.set_paused(true);
         s.apply(&GameEvent::Room("Town_01".into()));
-        assert!(s.room_since.is_none(), "a room change must not restart a stopped clock");
-        assert_eq!(s.room.as_deref(), Some("Town_01"), "the panel still says where we are");
+        assert!(
+            s.room_since.is_none(),
+            "a room change must not restart a stopped clock"
+        );
+        assert_eq!(
+            s.room.as_deref(),
+            Some("Town_01"),
+            "the panel still says where we are"
+        );
 
         // and a room clock left running by any other route banks nothing while
         // the session is held
@@ -3424,9 +4239,15 @@ mod tests {
         s.apply(&GameEvent::Room("Act_07_03".into()));
         s.set_paused(false);
 
-        let run = s.finish().expect("a session with earnings is worth keeping");
+        let run = s
+            .finish()
+            .expect("a session with earnings is worth keeping");
         let banked: u64 = run.zones.iter().map(|(_, secs)| secs).sum();
-        assert!(banked <= run.secs, "{banked} room-seconds inside a {}-second run", run.secs);
+        assert!(
+            banked <= run.secs,
+            "{banked} room-seconds inside a {}-second run",
+            run.secs
+        );
         assert!(
             !run.zones.iter().any(|(room, _)| room == "Town_01"),
             "the paused town trip is not where the run happened: {:?}",
@@ -3455,14 +4276,19 @@ mod tests {
         s.apply(&GameEvent::Room("Act_07_03".into()));
         s.room_since = Some(Instant::now() - Duration::from_secs(60));
 
-        let run = s.finish().expect("a session with earnings is worth keeping");
+        let run = s
+            .finish()
+            .expect("a session with earnings is worth keeping");
         assert_eq!(run.kills, 400);
         assert_eq!(run.xp, 50_000);
         assert_eq!(run.xp_in_level, Some(60_000));
         assert!(run.secs >= 600, "{}", run.secs);
         assert_eq!(run.character.as_deref(), Some("Test"));
         // the room it spent longest in comes first
-        assert_eq!(run.zones.first().map(|(room, _)| room.as_str()), Some("Act_07_02"));
+        assert_eq!(
+            run.zones.first().map(|(room, _)| room.as_str()),
+            Some("Act_07_02")
+        );
         assert!(run.zones[0].1 >= 300, "{:?}", run.zones);
     }
 
@@ -3497,13 +4323,21 @@ mod tests {
         s.level_mark.as_mut().unwrap().since_secs = now - 140;
         s.apply(&save(12, 40_236));
 
-        let run = s.finish().expect("the level gains earned XP and make a run");
+        let run = s
+            .finish()
+            .expect("the level gains earned XP and make a run");
         assert_eq!(run.level_splits.len(), 2);
         assert!(run.level_splits[0].hero);
-        assert_eq!((run.level_splits[0].from_level, run.level_splits[0].to_level), (10, 11));
+        assert_eq!(
+            (run.level_splits[0].from_level, run.level_splits[0].to_level),
+            (10, 11)
+        );
         assert_eq!(run.level_splits[0].secs, 95);
         assert!(run.level_splits[0].partial);
-        assert_eq!((run.level_splits[1].from_level, run.level_splits[1].to_level), (11, 12));
+        assert_eq!(
+            (run.level_splits[1].from_level, run.level_splits[1].to_level),
+            (11, 12)
+        );
         assert_eq!(run.level_splits[1].secs, 140);
         assert!(!run.level_splits[1].partial);
     }
@@ -3572,7 +4406,10 @@ mod tests {
         // A pause the player asked for is a different thing and outranks it.
         s.set_paused(true);
         s.progressed();
-        assert!(s.paused(), "a hand-made pause lasts until the same hand lifts it");
+        assert!(
+            s.paused(),
+            "a hand-made pause lasts until the same hand lifts it"
+        );
         s.set_paused(false);
         assert!(!s.paused());
     }
@@ -3599,6 +4436,7 @@ mod tests {
                 fingerprint: print.into(),
                 hash: String::new(),
                 ground,
+                rolls: Default::default(),
             }
         }
 
@@ -3610,8 +4448,14 @@ mod tests {
         assert!(s.prefs.prefer_ground);
         s.prefs.min_tier = 3;
 
-        assert!(s.apply(&sighting(true, 0, "a")).is_none(), "no grade on the floor, no alert");
-        assert!(s.apply(&sighting(false, 5, "a")).is_some(), "the bag proves the grade, and the roll never reached `told`");
+        assert!(
+            s.apply(&sighting(true, 0, "a")).is_none(),
+            "no grade on the floor, no alert"
+        );
+        assert!(
+            s.apply(&sighting(false, 5, "a")).is_some(),
+            "the bag proves the grade, and the roll never reached `told`"
+        );
 
         // Most pickups have no roll this app saw at all. They are announced.
         let mut t = GameStats::default();
@@ -3619,13 +4463,22 @@ mod tests {
 
         // And never twice: announced as it lands, quiet as it is taken.
         let mut u = GameStats::default();
-        assert!(u.apply(&sighting(true, 5, "c")).is_some(), "announced as it lands");
-        assert!(u.apply(&sighting(false, 5, "c")).is_none(), "and not again in the bag");
+        assert!(
+            u.apply(&sighting(true, 5, "c")).is_some(),
+            "announced as it lands"
+        );
+        assert!(
+            u.apply(&sighting(false, 5, "c")).is_none(),
+            "and not again in the bag"
+        );
 
         // Asking for the bag alone still means the bag alone.
         let mut v = GameStats::default();
         v.set_prefer_ground(false);
-        assert!(v.apply(&sighting(true, 5, "d")).is_none(), "the floor is not what was asked for");
+        assert!(
+            v.apply(&sighting(true, 5, "d")).is_none(),
+            "the floor is not what was asked for"
+        );
         assert!(v.apply(&sighting(false, 5, "d")).is_some());
     }
 
@@ -3660,10 +4513,21 @@ mod tests {
         s.apply(&save("Main", 1_001_000, 900_020, 5_002));
 
         let snap = s.snapshot(String::new());
-        assert_eq!(snap.xp.earned, 550, "500 on the main, 50 on the alt, and nothing between them");
+        assert_eq!(
+            snap.xp.earned, 550,
+            "500 on the main, 50 on the alt, and nothing between them"
+        );
         assert_eq!(snap.kills.earned, 12, "10 + 2, not nine hundred thousand");
-        let chests = snap.tallies.iter().find(|t| t.label == "Common").map(|t| t.total);
-        assert_eq!(chests, Some(1), "one chest on the main; the alt opened none after its mark");
+        let chests = snap
+            .tallies
+            .iter()
+            .find(|t| t.label == "Common")
+            .map(|t| t.total);
+        assert_eq!(
+            chests,
+            Some(1),
+            "one chest on the main; the alt opened none after its mark"
+        );
     }
 
     #[test]
@@ -3687,7 +4551,11 @@ mod tests {
         s.apply(&balance(107));
         // And back. This used to read as seventy-eight thousand earned.
         s.apply(&balance(78_101));
-        assert_eq!(s.snapshot(String::new()).gold.earned, 0, "nothing was earned by walking there and back");
+        assert_eq!(
+            s.snapshot(String::new()).gold.earned,
+            0,
+            "nothing was earned by walking there and back"
+        );
 
         // Past the high-water mark is earnings again.
         s.apply(&balance(80_101));
@@ -3730,7 +4598,11 @@ mod tests {
                 s.apply(&balance(110_000));
                 s.apply(&deposit(10_000));
             }
-            assert_eq!(s.snapshot(String::new()).gold.earned, 10_000, "{order}: the same ten thousand, counted once");
+            assert_eq!(
+                s.snapshot(String::new()).gold.earned,
+                10_000,
+                "{order}: the same ten thousand, counted once"
+            );
         }
     }
 
@@ -3753,14 +4625,26 @@ mod tests {
         // whole diet of zone packets — a handful, minutes apart, and the same
         // zone repeated whenever the player reloads without a rotation between.
         s.apply(&satanic_zone("Act_08_02"));
-        assert!(s.take_zone_change().is_none(), "learning where the zone is is not it moving");
+        assert!(
+            s.take_zone_change().is_none(),
+            "learning where the zone is is not it moving"
+        );
         s.apply(&satanic_zone("Act_08_02"));
-        assert!(s.take_zone_change().is_none(), "the same zone said twice is one zone");
+        assert!(
+            s.take_zone_change().is_none(),
+            "the same zone said twice is one zone"
+        );
 
         s.apply(&satanic_zone("Act_03_01"));
         let moved = s.take_zone_change().expect("the zone moved");
-        assert_eq!(moved.zone, "Act_03_01", "and it says which zone it moved to");
-        assert!(s.take_zone_change().is_none(), "announced once, not until the next look");
+        assert_eq!(
+            moved.zone, "Act_03_01",
+            "and it says which zone it moved to"
+        );
+        assert!(
+            s.take_zone_change().is_none(),
+            "announced once, not until the next look"
+        );
     }
 
     #[test]
@@ -3774,9 +4658,15 @@ mod tests {
         // the meantime is news to this app rather than news to tell.
         s.reset_after_blackout();
         s.apply(&satanic_zone("Act_11_01"));
-        assert!(s.take_zone_change().is_none(), "a blackout must not be reported as a rotation");
+        assert!(
+            s.take_zone_change().is_none(),
+            "a blackout must not be reported as a rotation"
+        );
         s.apply(&satanic_zone("Act_02_04"));
-        assert!(s.take_zone_change().is_some(), "the packet after it re-arms the guard");
+        assert!(
+            s.take_zone_change().is_some(),
+            "the packet after it re-arms the guard"
+        );
 
         // The Reset button, pressed mid-farm. Nothing went dark: the game has
         // been up all along and the zone is exactly where we last saw it. This
@@ -3785,7 +4675,10 @@ mod tests {
         // player pressed Reset to start counting.
         s.reset();
         s.apply(&satanic_zone("Act_05_05"));
-        assert!(s.take_zone_change().is_some(), "a session reset must not swallow a rotation");
+        assert!(
+            s.take_zone_change().is_some(),
+            "a session reset must not swallow a rotation"
+        );
     }
 
     #[test]
@@ -3801,16 +4694,25 @@ mod tests {
         // zone changes in the capture on disk are this.
         s.apply(&GameEvent::ZoneRegion("2029974116".into()));
         s.apply(&rolled_zone("Act_04_05", vec![2, 5, 7]));
-        assert!(s.take_zone_change().is_none(), "another region answering is not news");
+        assert!(
+            s.take_zone_change().is_none(),
+            "another region answering is not news"
+        );
 
         s.apply(&GameEvent::ZoneRegion("8917481016".into()));
         s.apply(&rolled_zone("Act_02_01", vec![1]));
-        assert!(s.take_zone_change().is_none(), "nor is the next one, on a third region");
+        assert!(
+            s.take_zone_change().is_none(),
+            "nor is the next one, on a third region"
+        );
 
         // and once it settles, that region's own rotation still lands
         s.apply(&GameEvent::ZoneRegion("8917481016".into()));
         s.apply(&rolled_zone("Act_07_02", vec![1]));
-        assert!(s.take_zone_change().is_some(), "the region that asked before is the one that moved");
+        assert!(
+            s.take_zone_change().is_some(),
+            "the region that asked before is the one that moved"
+        );
     }
 
     #[test]
@@ -3821,7 +4723,10 @@ mod tests {
         s.apply(&satanic_zone("Act_01_01"));
         s.take_zone_change();
         s.apply(&satanic_zone("Act_02_02"));
-        assert!(s.take_zone_change().is_some(), "both regions unknown compares equal");
+        assert!(
+            s.take_zone_change().is_some(),
+            "both regions unknown compares equal"
+        );
     }
 
     #[test]
@@ -3831,7 +4736,10 @@ mod tests {
         s.take_zone_change();
 
         s.apply(&rolled_zone("Act_08_02", vec![3, 2, 1]));
-        assert!(s.take_zone_change().is_none(), "the same buffs in another order are the same roll");
+        assert!(
+            s.take_zone_change().is_none(),
+            "the same buffs in another order are the same roll"
+        );
 
         s.apply(&rolled_zone("Act_08_02", vec![1, 2, 14]));
         assert!(
@@ -3850,24 +4758,84 @@ mod tests {
         // an upgrade from a settings file with no list in it must keep doing.
         assert!(s.prefs.zone_buffs.is_empty());
         s.apply(&rolled_zone("Act_02_02", vec![7]));
-        assert!(s.take_zone_change().is_some(), "an empty pick lets every rotation through");
+        assert!(
+            s.take_zone_change().is_some(),
+            "an empty pick lets every rotation through"
+        );
         s.apply(&rolled_zone("Act_02_03", vec![]));
-        assert!(s.take_zone_change().is_some(), "including one the game gave no buffs at all");
+        assert!(
+            s.take_zone_change().is_some(),
+            "including one the game gave no buffs at all"
+        );
 
         s.prefs.zone_buffs = vec![14, 15, 16];
         s.apply(&rolled_zone("Act_03_01", vec![7, 21]));
-        assert!(s.take_zone_change().is_none(), "none of the three: it passes in silence");
+        assert!(
+            s.take_zone_change().is_none(),
+            "none of the three: it passes in silence"
+        );
         s.apply(&rolled_zone("Act_03_02", vec![]));
-        assert!(s.take_zone_change().is_none(), "and a zone with no buffs cannot match a pick");
+        assert!(
+            s.take_zone_change().is_none(),
+            "and a zone with no buffs cannot match a pick"
+        );
 
         s.apply(&rolled_zone("Act_04_01", vec![7, 15]));
         let hit = s.take_zone_change().expect("one of the three is enough");
-        assert_eq!(hit.buffs, vec![7, 15], "and the alert carries what the zone rolled");
+        assert_eq!(
+            hit.buffs,
+            vec![7, 15],
+            "and the alert carries what the zone rolled"
+        );
 
         // A rotation ruled out is still a rotation dealt with: the flag goes
         // either way, so the next look does not announce it late.
         s.apply(&rolled_zone("Act_05_01", vec![21]));
         assert!(s.take_zone_change().is_none());
-        assert!(s.take_zone_change().is_none(), "a filtered rotation is not left pending");
+        assert!(
+            s.take_zone_change().is_none(),
+            "a filtered rotation is not left pending"
+        );
+    }
+
+    #[test]
+    fn the_six_colossal_chest_zones_are_recognised_across_zone_prefixes() {
+        for zone in [
+            "Act_01_05",
+            "SZ_03_03",
+            "Satanic_03_04",
+            "Act_04_03",
+            "SZ_05_02",
+            "satanic_06_04",
+        ] {
+            assert!(is_colossal_chest_zone(zone), "{zone} owns a Colossal Chest");
+        }
+
+        for zone in ["Act_01_04", "Act_05_05", "Town_01_05", "garbage"] {
+            assert!(
+                !is_colossal_chest_zone(zone),
+                "{zone} is not a Colossal Chest zone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_colossal_chest_rotation_bypasses_the_buff_filter() {
+        let mut s = GameStats::default();
+        s.apply(&rolled_zone("Act_01_01", vec![7]));
+        s.take_zone_change();
+        s.prefs.zone_buffs = vec![16];
+
+        s.apply(&rolled_zone("Act_01_05", vec![7]));
+        let hit = s
+            .take_zone_change()
+            .expect("a Colossal Chest is always worth the alert");
+        assert!(hit.colossal_chest);
+
+        s.apply(&rolled_zone("Act_02_02", vec![7]));
+        assert!(
+            s.take_zone_change().is_none(),
+            "ordinary rotations still obey the buff filter"
+        );
     }
 }

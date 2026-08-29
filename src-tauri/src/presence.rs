@@ -82,7 +82,10 @@ fn zone_label(room: &str) -> String {
     if let Some(name) = crate::items::room_name(room) {
         return name.into();
     }
-    if room.get(..4).is_some_and(|head| head.eq_ignore_ascii_case("town")) {
+    if room
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("town"))
+    {
         return "Town".into();
     }
     match zone_pair(room) {
@@ -150,7 +153,11 @@ fn build(app: &AppHandle) -> Card {
     let stats = shared.stats();
     let snap = stats.snapshot(status);
     let start = stats.started_ms() as i64;
-    let named: i64 = NAMED.iter().filter_map(|r| snap.items.get(*r)).map(|i| i.total).sum();
+    let named: i64 = NAMED
+        .iter()
+        .filter_map(|r| snap.items.get(*r))
+        .map(|i| i.total)
+        .sum();
     let chase = (stats.graded(SS) - named).max(0);
     drop(stats);
 
@@ -195,12 +202,19 @@ fn build(app: &AppHandle) -> Card {
     if snap.gold.earned > 0 {
         haul.push(format!("{} gold", compact(snap.gold.earned)));
     }
-    let state = if haul.is_empty() { "just started".to_string() } else { haul.join(" · ") };
+    let state = if haul.is_empty() {
+        "just started".to_string()
+    } else {
+        haul.join(" · ")
+    };
 
     // the character's own progress, kept for the tooltip: the two visible lines
     // belong to the run
     let hover = match &snap.character {
-        Some(c) => format!("HS Tracker · level {} · hero level {}", c.level, c.herolevel),
+        Some(c) => format!(
+            "HS Tracker · level {} · hero level {}",
+            c.level, c.herolevel
+        ),
         None => "HS Tracker".to_string(),
     };
 
@@ -210,13 +224,23 @@ fn build(app: &AppHandle) -> Card {
         snap.act,
     );
 
-    Card { details: clip(where_at, LINE), state: clip(state, LINE), hover: clip(hover, LINE), start, satanic }
+    Card {
+        details: clip(where_at, LINE),
+        state: clip(state, LINE),
+        hover: clip(hover, LINE),
+        start,
+        satanic,
+    }
 }
 
 fn send(client: &mut DiscordIpcClient, card: &Card) -> Result<(), Error> {
-    let mut assets = Assets::new().large_image("logo").large_text(card.hover.as_str());
+    let mut assets = Assets::new()
+        .large_image("logo")
+        .large_text(card.hover.as_str());
     if let Some(zone) = &card.satanic {
-        assets = assets.small_image("satanic").small_text(format!("Satanic Zone · {zone}"));
+        assets = assets
+            .small_image("satanic")
+            .small_text(format!("Satanic Zone · {zone}"));
     }
     client.set_activity(
         Activity::new()
@@ -348,7 +372,11 @@ mod tests {
         assert_eq!(zone_label("Act_08_02"), "Flooded Plains");
         assert_eq!(zone_label("Act_02_05"), "The Glacial Trail");
         assert_eq!(zone_label("Town_01_rm"), "Town of Inoya");
-        assert_eq!(zone_label("Shadow_Realm_rm"), "Shadow Realm", "and not \"Shadow Realm rm\"");
+        assert_eq!(
+            zone_label("Shadow_Realm_rm"),
+            "Shadow Realm",
+            "and not \"Shadow Realm rm\""
+        );
 
         // and the arithmetic underneath, for a room this table has not caught up
         // with — a patch can add one before the table is rebuilt
@@ -368,7 +396,10 @@ mod tests {
     #[test]
     fn the_badge_goes_out_with_the_act() {
         // the game said so, and the act agrees
-        assert_eq!(satanic_badge(true, Some("Act_08_02"), 8).as_deref(), Some("Flooded Plains"));
+        assert_eq!(
+            satanic_badge(true, Some("Act_08_02"), 8).as_deref(),
+            Some("Flooded Plains")
+        );
 
         // it said so before the player walked into another act; the save has
         // moved on and the heartbeat has not

@@ -1,9 +1,12 @@
+mod item_rolls;
 mod items;
 mod log;
 mod parser;
 mod presence;
 mod sniffer;
 mod stats;
+mod twitch;
+mod twitch_runtime;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -18,14 +21,26 @@ use tauri::{AppHandle, Emitter, LogicalSize, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 /// Alert kinds that own a configurable sound (not item rarities — see stats).
-const SOUND_KEYS: [&str; 7] = ["satanic", "set", "heroic", "angelic", "unholy", "mail", "zone"];
+const SOUND_KEYS: [&str; 7] = [
+    "satanic", "set", "heroic", "angelic", "unholy", "mail", "zone",
+];
 
 /// A sound is either one of the built-in alerts or a list's own file,
 /// named `list-<id>`. Anything else must not reach the filesystem.
 fn sound_key(key: &str) -> bool {
-    SOUND_KEYS.contains(&key) || (key.len() <= 40 && key.starts_with("list-") && key[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    SOUND_KEYS.contains(&key)
+        || (key.len() <= 40
+            && key.starts_with("list-")
+            && key[5..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
-const SOUND_EXTS: [(&str, &str); 4] = [("mp3", "audio/mpeg"), ("wav", "audio/wav"), ("ogg", "audio/ogg"), ("flac", "audio/flac")];
+const SOUND_EXTS: [(&str, &str); 4] = [
+    ("mp3", "audio/mpeg"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("flac", "audio/flac"),
+];
 
 // The overlay's width never changes; its height is whatever its rows add up to,
 // and the web side measures that itself (see `fit_overlay`). The figures here
@@ -134,7 +149,10 @@ fn overlay_height(settings: &Settings) -> f64 {
     let panel = if measured > 0 {
         measured as f64
     } else {
-        let rows = OVERLAY_ROWS.iter().filter(|r| !settings.hidden.iter().any(|h| h == *r)).count();
+        let rows = OVERLAY_ROWS
+            .iter()
+            .filter(|r| !settings.hidden.iter().any(|h| h == *r))
+            .count();
         34.0 + 33.0 * rows.max(1) as f64
     };
     // The strip stands beside the panel and can be the taller of the two — a
@@ -148,7 +166,6 @@ const HK_TOGGLE: &str = "ctrl+shift+o";
 const HK_LOCK: &str = "ctrl+shift+l";
 const HK_RESET: &str = "ctrl+shift+r";
 const HK_PAUSE: &str = "ctrl+shift+p";
-
 
 /// Five cells, 1px between them and 3 more under the lock — see .strip in
 /// App.svelte, which is the same arithmetic in the other language.
@@ -169,6 +186,10 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// and both ask for one; the label is the same, so the second build fails and
 /// logs an error about a window that is in fact fine.
 static BUILDING_FLOURISH: AtomicBool = AtomicBool::new(false);
+/// A window handle exists before its page has installed the event listener.
+/// Previewing into that gap reports success and draws nothing, so the page says
+/// when it is actually ready to receive an announcement.
+static FLOURISH_READY: AtomicBool = AtomicBool::new(false);
 static TICKER: AtomicBool = AtomicBool::new(true);
 /// The ticker is a transparent window pinned over the game: while it is on
 /// screen the compositor keeps blending it, empty or not. It is only shown
@@ -202,7 +223,10 @@ pub struct SoundCfg {
 
 impl Default for SoundCfg {
     fn default() -> Self {
-        Self { enabled: true, volume: 0.5 }
+        Self {
+            enabled: true,
+            volume: 0.5,
+        }
     }
 }
 
@@ -247,6 +271,94 @@ pub struct NotableGroup {
     pub names: Vec<String>,
 }
 
+/// Independent parking spots for the one shared visual-alert window.
+///
+/// These string values are part of the event/IPC contract. Keep them aligned
+/// with the alert families attached to `flourish-play` payloads.
+const FLOURISH_FAMILIES: [FlourishFamily; 5] = [
+    FlourishFamily::Loot,
+    FlourishFamily::HighRoll,
+    FlourishFamily::Stat,
+    FlourishFamily::Zone,
+    FlourishFamily::Twitch,
+];
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FlourishFamily {
+    Loot,
+    HighRoll,
+    Stat,
+    Zone,
+    Twitch,
+}
+
+impl FlourishFamily {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Loot => "loot",
+            Self::HighRoll => "high_roll",
+            Self::Stat => "stat",
+            Self::Zone => "zone",
+            Self::Twitch => "twitch",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        FLOURISH_FAMILIES
+            .into_iter()
+            .find(|family| family.key() == value)
+    }
+
+    /// Namespace the family beside the legacy `flourish` entry in
+    /// positions.json. These are physical desktop coordinates, not portable
+    /// preferences, and therefore deliberately do not belong to Settings.
+    fn position_key(self) -> &'static str {
+        match self {
+            Self::Loot => "flourish:loot",
+            Self::HighRoll => "flourish:high_roll",
+            Self::Stat => "flourish:stat",
+            Self::Zone => "flourish:zone",
+            Self::Twitch => "flourish:twitch",
+        }
+    }
+}
+
+/// Physical desktop coordinates, including negative values for monitors to the
+/// left or above the primary display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct FlourishPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl From<tauri::PhysicalPosition<i32>> for FlourishPosition {
+    fn from(value: tauri::PhysicalPosition<i32>) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+        }
+    }
+}
+
+fn flourish_position_targets(selected: FlourishFamily, apply_all: bool) -> Vec<FlourishFamily> {
+    if apply_all {
+        FLOURISH_FAMILIES.to_vec()
+    } else {
+        vec![selected]
+    }
+}
+
+fn set_flourish_position_values(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    selected: FlourishFamily,
+    position: tauri::PhysicalPosition<i32>,
+    apply_all: bool,
+) {
+    for family in flourish_position_targets(selected, apply_all) {
+        map.insert(family.position_key().into(), position_value(position));
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -259,11 +371,11 @@ pub struct Settings {
     /// The satanic zone rotating: its chime, its volume, and — because the two
     /// are one decision — whether the overlay's zone chip pulses with it.
     pub zone: SoundCfg,
-    /// Which of the satanic zone's buffs are worth the alert. Empty is every
-    /// rotation, not none of them: the list narrows the alert, so a list that
-    /// narrows nothing lets everything through. No `serde(default)` of its own
-    /// — the struct already carries one, and a second would outlive a change to
-    /// `Default` and quietly keep handing old files a list nobody chose.
+    /// Which of the satanic zone's buffs are worth an ordinary alert. Empty is
+    /// every rotation, not none of them; native Colossal Chest zones bypass the
+    /// list. No `serde(default)` of its own — the struct already carries one,
+    /// and a second would outlive a change to `Default` and quietly keep handing
+    /// old files a list nobody chose.
     pub zone_buffs: Vec<u8>,
     /// rarities worth announcing at all, and the tier they must reach
     pub alerts: Vec<String>,
@@ -329,6 +441,32 @@ pub struct Settings {
     /// appears for a few seconds and is gone again. Off by default: a window
     /// held open is a window the compositor keeps blending, empty or not.
     pub flourish_always: bool,
+    /// Renderer profile and player-created profiles for the FX Lab. These are
+    /// deliberately schema-light at the Rust boundary: the renderer owns the
+    /// visual vocabulary and can add a knob without making an older settings
+    /// file unreadable.
+    pub flourish_fx: serde_json::Value,
+    pub flourish_fx_presets: Vec<serde_json::Value>,
+    pub flourish_fx_preset: String,
+    /// Twitch's public application identifier and alert preferences. OAuth
+    /// tokens never live here: settings can be exported and are deliberately
+    /// ordinary JSON, while credentials belong to the operating-system vault.
+    pub twitch_enabled: bool,
+    pub twitch_client_id: String,
+    pub twitch_alerts: serde_json::Value,
+    /// Experimental/network integrations stay inert unless the user has
+    /// explicitly opened Debug Mode. Their saved preferences are retained.
+    pub debug_mode: bool,
+    /// Exact item rolls are only present on an inventory pickup.  These two
+    /// settings control the special pickup flourish independently of the
+    /// ordinary rarity/tier filter above.
+    pub high_roll_enabled: bool,
+    /// The weakest variable roll an item may have, as a percentage of its own
+    /// min/max range.  Zero is useful for testing; 100 means every rolled
+    /// component must be perfect.
+    pub high_roll_threshold: u8,
+    /// Independent OR rules over the numeric stat values in the pickup packet.
+    pub stat_alert_rules: Vec<stats::StatAlertRule>,
     /// show the run in Discord while the game is open. Off unless asked for:
     /// it puts what the player is doing in front of everyone on their list.
     pub discord: bool,
@@ -369,9 +507,15 @@ impl Default for Settings {
             zone: SoundCfg::default(),
             // every rotation, until the player narrows it
             zone_buffs: Vec::new(),
-            alerts: stats::JOURNAL_RARITIES.iter().map(|r| r.to_string()).collect(),
+            alerts: stats::JOURNAL_RARITIES
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
             min_tier: 0,
-            notable: stats::default_notable().into_iter().map(|(label, names)| NotableGroup { label, names }).collect(),
+            notable: stats::default_notable()
+                .into_iter()
+                .map(|(label, names)| NotableGroup { label, names })
+                .collect(),
             filters: Vec::new(),
             filter: String::new(),
             use_filter: true,
@@ -394,7 +538,10 @@ impl Default for Settings {
             flourish_scale: 1.0,
             flourish_shade: 0.55,
             flourish_secs: 6.0,
-            flourish_rarities: ["Satanic", "Set", "Heroic", "Angelic", "Unholy"].iter().map(|r| r.to_string()).collect(),
+            flourish_rarities: ["Satanic", "Set", "Heroic", "Angelic", "Unholy"]
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
             // grade 1 is D, which this slider reads as "any"
             flourish_tier: 1,
             flourish_listed: false,
@@ -403,6 +550,16 @@ impl Default for Settings {
             // pillar in the way. On, for the same reason the announcement is.
             flourish_zone: true,
             flourish_always: false,
+            flourish_fx: serde_json::json!({}),
+            flourish_fx_presets: Vec::new(),
+            flourish_fx_preset: "starter-hero-siege".into(),
+            twitch_enabled: false,
+            twitch_client_id: String::new(),
+            twitch_alerts: serde_json::json!({}),
+            debug_mode: false,
+            high_roll_enabled: true,
+            high_roll_threshold: 75,
+            stat_alert_rules: Vec::new(),
             discord: false,
             compact: false,
             launch_compact: false,
@@ -436,12 +593,18 @@ pub(crate) fn overlay_supported() -> bool {
 /// lands on Wayland. Only the first entry says what the toolkit will use.
 #[cfg(not(windows))]
 fn forced_x11() -> bool {
-    std::env::var("GDK_BACKEND").is_ok_and(|v| v.to_lowercase().split(',').next().is_some_and(|first| first.trim() == "x11"))
+    std::env::var("GDK_BACKEND").is_ok_and(|v| {
+        v.to_lowercase()
+            .split(',')
+            .next()
+            .is_some_and(|first| first.trim() == "x11")
+    })
 }
 
 #[cfg(not(windows))]
 fn wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
 }
 
 /// XWayland's socket, which is what the X11 backend actually needs.
@@ -619,7 +782,10 @@ pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
     // anyone is going to read, and it stops a debugging aid from quietly filling
     // a disk.
     const CAPTURE_KEEP: u64 = 64 * 1024 * 1024;
-    if guard.as_ref().is_some_and(|(_, written)| *written >= CAPTURE_KEEP) {
+    if guard
+        .as_ref()
+        .is_some_and(|(_, written)| *written >= CAPTURE_KEEP)
+    {
         if let Some((mut f, _)) = guard.take() {
             let _ = f.flush();
         }
@@ -627,12 +793,17 @@ pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
     }
 
     if guard.is_none() {
-        let opened = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path);
         let Ok(f) = opened else { return };
         let had = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         *guard = Some((std::io::BufWriter::new(f), had));
     }
-    let Some((f, written)) = guard.as_mut() else { return };
+    let Some((f, written)) = guard.as_mut() else {
+        return;
+    };
     for m in messages {
         // the sender is what tells a character upload apart from the server's
         // copy of it
@@ -658,9 +829,17 @@ pub(crate) fn debug_log(messages: &[serde_json::Value], src: std::net::IpAddr) {
 pub(crate) fn dev_log(events: &[parser::GameEvent], src: std::net::IpAddr) {
     for e in events {
         let line = match e {
-            parser::GameEvent::Gold(c) => format!("gold  GSS {} GSH {} GNS {} +{}", c.gss, c.gsh, c.gns, c.delta),
+            parser::GameEvent::Gold(c) => format!(
+                "gold  GSS {} GSH {} GNS {} +{}",
+                c.gss, c.gsh, c.gns, c.delta
+            ),
             parser::GameEvent::XpGain(xp) => format!("xp    +{xp} (guild share)"),
-            parser::GameEvent::Account { experience, kills, name, .. } => {
+            parser::GameEvent::Account {
+                experience,
+                kills,
+                name,
+                ..
+            } => {
                 format!("save  {name}: xp {experience}, kills {kills}")
             }
             parser::GameEvent::ItemsLetGo(gone) => format!("gone  {} out of the bags", gone.len()),
@@ -668,7 +847,12 @@ pub(crate) fn dev_log(events: &[parser::GameEvent], src: std::net::IpAddr) {
             parser::GameEvent::Mail(has) => format!("mail  {has}"),
             parser::GameEvent::Room(room) => format!("room  {room}"),
             parser::GameEvent::ZoneRegion(id) => format!("asks  zone, for region {id}"),
-            parser::GameEvent::Vitals { mf, level, hlevel, satanic_here } => {
+            parser::GameEvent::Vitals {
+                mf,
+                level,
+                hlevel,
+                satanic_here,
+            } => {
                 let say = |v: &Option<i64>| v.map_or("-".into(), |n| n.to_string());
                 let sz = satanic_here.map_or("-".into(), |b| b.to_string());
                 format!("vitals  mf {}  lv {level}  hlv {hlevel}  sz {sz}", say(mf))
@@ -684,8 +868,19 @@ pub(crate) fn dev_log(events: &[parser::GameEvent], src: std::net::IpAddr) {
                 ..
             } => {
                 // an empty name means the item tables predate this item
-                let label = if name.is_empty() { format!("unknown {item_type}:{item_id}:{weapon_type}") } else { name.clone() };
-                format!("item  {label:?} rarity {rarity} tier {tier} {}", if *ground { "on the ground" } else { "picked up" })
+                let label = if name.is_empty() {
+                    format!("unknown {item_type}:{item_id}:{weapon_type}")
+                } else {
+                    name.clone()
+                };
+                format!(
+                    "item  {label:?} rarity {rarity} tier {tier} {}",
+                    if *ground {
+                        "on the ground"
+                    } else {
+                        "picked up"
+                    }
+                )
             }
             parser::GameEvent::Found { finder, name } => format!("chat  {finder:?} found {name:?}"),
             parser::GameEvent::SatanicZone { zone, .. } => format!("zone  {zone}"),
@@ -699,7 +894,10 @@ pub(crate) fn dev_log(_: &[parser::GameEvent], _: std::net::IpAddr) {}
 
 #[cfg(windows)]
 fn exe_dir() -> PathBuf {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_default()
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default()
 }
 
 /// Everything the app writes lives here. On Windows that is the folder the
@@ -756,8 +954,15 @@ fn sounds_dir() -> PathBuf {
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let stem = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let staged = path.with_file_name(format!("{stem}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = path.with_file_name(format!(
+        "{stem}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     // The rename is atomic, but only over what the disk actually holds: without
     // this the metadata operation can land while the bytes are still in the
     // cache, and a power cut leaves the new name pointing at an empty file —
@@ -799,13 +1004,21 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// tripled a megabyte for nobody's benefit. The doc said as much while the code
 /// had stopped making the distinction, so settings.json went out on one line.
 fn write_json<T: Serialize>(path: &std::path::Path, value: &T, pretty: bool) {
-    let encode = if pretty { serde_json::to_vec_pretty } else { serde_json::to_vec };
+    let encode = if pretty {
+        serde_json::to_vec_pretty
+    } else {
+        serde_json::to_vec
+    };
     let json = match encode(value) {
         Ok(j) => j,
         Err(e) => return log::error(format!("cannot encode {}: {e}", path.display())),
     };
     if let Err(e) = write_atomic(path, &json) {
-        log::once(&path.display().to_string(), "error", format!("cannot write {}: {e}", path.display()));
+        log::once(
+            &path.display().to_string(),
+            "error",
+            format!("cannot write {}: {e}", path.display()),
+        );
     }
 }
 
@@ -827,7 +1040,11 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::pa
         Ok(raw) => raw,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                log::once(&path.display().to_string(), "error", format!("cannot read {}: {e}", path.display()));
+                log::once(
+                    &path.display().to_string(),
+                    "error",
+                    format!("cannot read {}: {e}", path.display()),
+                );
             }
             return T::default();
         }
@@ -835,7 +1052,12 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::pa
     match serde_json::from_str(&raw) {
         Ok(value) => value,
         Err(e) => {
-            let kept = path.with_file_name(format!("{}.bad", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            let kept = path.with_file_name(format!(
+                "{}.bad",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
             let moved = std::fs::rename(path, &kept);
             log::error(format!(
                 "{} does not parse ({e}); {}",
@@ -870,7 +1092,10 @@ fn carried_path() -> PathBuf {
 /// them when it saves, so without this a restart shows zeros until the next
 /// save — which can be a whole farming run away.
 fn read_carried() -> stats::Carried {
-    std::fs::read_to_string(carried_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    std::fs::read_to_string(carried_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn save_carried(app: &AppHandle) {
@@ -882,6 +1107,31 @@ fn save_carried(app: &AppHandle) {
 // the one window whose position is a choice rather than a convenience.
 const REMEMBERED_WINDOWS: [&str; 3] = ["main", "dashboard", "flourish"];
 
+fn stored_window_position(value: &serde_json::Value) -> Option<tauri::PhysicalPosition<i32>> {
+    let position = value.as_array()?;
+    let x = i32::try_from(position.first()?.as_i64()?).ok()?;
+    let y = i32::try_from(position.get(1)?.as_i64()?).ok()?;
+    Some(tauri::PhysicalPosition::new(x, y))
+}
+
+fn position_value(position: tauri::PhysicalPosition<i32>) -> serde_json::Value {
+    serde_json::json!([position.x, position.y])
+}
+
+/// Lazy migration from the original one-position flourish store. Each family
+/// receives its own copy in memory, so moving one later cannot drag every
+/// still-unset family through the shared fallback. The caller does not write
+/// this map merely because it was migrated.
+fn seed_flourish_position_values(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(legacy) = map.get("flourish").cloned() else {
+        return;
+    };
+    for family in FLOURISH_FAMILIES {
+        map.entry(family.position_key())
+            .or_insert_with(|| legacy.clone());
+    }
+}
+
 /// Where each window was, and how big — the dashboard can be resized, so its
 /// size is worth remembering too. Only windows that are actually on screen have
 /// geometry worth writing down: a hidden one reports (0, 0) on GTK and a
@@ -890,19 +1140,49 @@ fn window_positions(app: &AppHandle) -> serde_json::Map<String, serde_json::Valu
     let mut map = serde_json::Map::new();
     for label in REMEMBERED_WINDOWS {
         let Some(w) = app.get_webview_window(label) else {
+            // In particular, preserve the old single flourish point while its
+            // optional webview has never been built this session.
+            if let Some(position) = parked(label) {
+                map.insert(label.into(), position_value(position));
+            }
             continue;
         };
+        if label == "flourish" && PLACING.load(Ordering::Relaxed) {
+            // A drag is tentative until Save succeeds. The periodic geometry
+            // writer must not commit it behind Cancel's back.
+            if let Some(pos) = parked(label) {
+                let value = w.outer_size().map_or_else(
+                    |_| position_value(pos),
+                    |size| serde_json::json!([pos.x, pos.y, size.width, size.height]),
+                );
+                map.insert(label.into(), value);
+            }
+            continue;
+        }
         if !on_screen(&w) {
             // keep whatever the last run knew rather than overwrite it with junk
             if let Some(pos) = parked(label) {
-                if let Ok(size) = w.outer_size() {
-                    map.insert(label.into(), serde_json::json!([pos.x, pos.y, size.width, size.height]));
-                }
+                let value = w.outer_size().map_or_else(
+                    |_| position_value(pos),
+                    |size| serde_json::json!([pos.x, pos.y, size.width, size.height]),
+                );
+                map.insert(label.into(), value);
             }
             continue;
         }
         if let (Ok(pos), Ok(size)) = (w.outer_position(), w.outer_size()) {
-            map.insert(label.into(), serde_json::json!([pos.x, pos.y, size.width, size.height]));
+            map.insert(
+                label.into(),
+                serde_json::json!([pos.x, pos.y, size.width, size.height]),
+            );
+        }
+    }
+    // Family points are not windows of their own, but they share this store
+    // because it is the app's non-portable physical desktop geometry. They are
+    // intentionally absent from settings export/import.
+    for family in FLOURISH_FAMILIES {
+        if let Some(position) = parked(family.position_key()) {
+            map.insert(family.position_key().into(), position_value(position));
         }
     }
     map
@@ -925,11 +1205,18 @@ fn can_place_windows() -> bool {
     }
 }
 
-fn save_window_positions(app: &AppHandle) {
+fn persist_window_positions(app: &AppHandle) -> Result<(), String> {
     if !can_place_windows() {
-        return;
+        return Ok(());
     }
-    write_json(&positions_path(), &window_positions(app), false);
+    let json = serde_json::to_vec(&window_positions(app)).map_err(|error| error.to_string())?;
+    write_atomic(&positions_path(), &json).map_err(|error| error.to_string())
+}
+
+fn save_window_positions(app: &AppHandle) {
+    if let Err(error) = persist_window_positions(app) {
+        log::error(format!("cannot save window positions: {error}"));
+    }
 }
 
 /// A clean exit is not guaranteed (task manager, crash), so positions are also
@@ -966,36 +1253,59 @@ fn restore_window_positions(app: &AppHandle) {
     let Ok(saved) = std::fs::read_to_string(positions_path()) else {
         return;
     };
-    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&saved) else {
+    let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&saved)
+    else {
         return;
     };
+    seed_flourish_position_values(&mut map);
     let monitors = app.available_monitors().unwrap_or_default();
     let on_screen = |x: i32, y: i32| {
-        monitors.iter().any(|m| {
-            let p = m.position();
-            let s = m.size();
-            x >= p.x - 50 && x < p.x + s.width as i32 && y >= p.y - 50 && y < p.y + s.height as i32
-        })
+        monitors.is_empty()
+            || monitors.iter().any(|m| {
+                let p = m.position();
+                let s = m.size();
+                x >= p.x - 50
+                    && x < p.x + s.width as i32
+                    && y >= p.y - 50
+                    && y < p.y + s.height as i32
+            })
     };
+    // Family points stay cached even if their monitor is temporarily absent;
+    // dequeue-time placement checks the current monitor set before using one.
+    // Keeping them here prevents a periodic geometry save from erasing them.
+    for family in FLOURISH_FAMILIES {
+        if let Some(position) = map
+            .get(family.position_key())
+            .and_then(stored_window_position)
+        {
+            park(family.position_key(), position);
+        }
+    }
     for label in REMEMBERED_WINDOWS {
-        let Some(pos) = map.get(label).and_then(|v| v.as_array()) else {
+        let Some(value) = map.get(label) else {
             continue;
         };
-        let (Some(x), Some(y)) = (pos.first().and_then(|v| v.as_i64()), pos.get(1).and_then(|v| v.as_i64())) else {
+        let Some(position) = stored_window_position(value) else {
             continue;
         };
-        if !on_screen(x as i32, y as i32) {
+        if !on_screen(position.x, position.y) {
             continue;
         }
+        // seed the in-memory copy too: a window that starts hidden has no
+        // geometry of its own to save later, and this is where it comes from
+        park(label, position);
         let Some(w) = app.get_webview_window(label) else {
             continue;
         };
-        // seed the in-memory copy too: a window that starts hidden has no
-        // geometry of its own to save later, and this is where it comes from
-        park(label, tauri::PhysicalPosition::new(x as i32, y as i32));
-        let _ = w.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
+        let _ = w.set_position(position);
         // older files hold just a position; a size only comes back if it fits
-        if let (Some(width), Some(height)) = (pos.get(2).and_then(|v| v.as_u64()), pos.get(3).and_then(|v| v.as_u64())) {
+        let Some(pos) = value.as_array() else {
+            continue;
+        };
+        if let (Some(width), Some(height)) = (
+            pos.get(2).and_then(|v| v.as_u64()),
+            pos.get(3).and_then(|v| v.as_u64()),
+        ) {
             if width >= 200 && height >= 200 {
                 let _ = w.set_size(tauri::PhysicalSize::new(width as u32, height as u32));
             }
@@ -1017,15 +1327,23 @@ struct LaunchMonitor {
 /// Tauri exposes the operating system's stable display name where it has one.
 /// Geometry is the fallback on desktops that do not name their outputs.
 fn launch_monitor_id(monitor: &tauri::Monitor) -> String {
-    monitor.name().filter(|name| !name.is_empty()).cloned().unwrap_or_else(|| {
-        let (p, s) = (monitor.position(), monitor.size());
-        format!("geometry:{}:{}:{}:{}", p.x, p.y, s.width, s.height)
-    })
+    monitor
+        .name()
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            let (p, s) = (monitor.position(), monitor.size());
+            format!("geometry:{}:{}:{}:{}", p.x, p.y, s.width, s.height)
+        })
 }
 
 #[tauri::command]
 fn get_monitors(app: AppHandle) -> Vec<LaunchMonitor> {
-    let primary = app.primary_monitor().ok().flatten().map(|m| launch_monitor_id(&m));
+    let primary = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| launch_monitor_id(&m));
     app.available_monitors()
         .unwrap_or_default()
         .into_iter()
@@ -1066,8 +1384,12 @@ fn place_launch_face(app: &AppHandle, settings: &Settings, compact: bool) {
         .or_else(|| monitors.into_iter().next());
     let Some(monitor) = monitor else { return };
     let label = if compact { "main" } else { "dashboard" };
-    let Some(window) = app.get_webview_window(label) else { return };
-    let Ok(size) = window.outer_size() else { return };
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
     let (origin, screen) = (monitor.position(), monitor.size());
     let x = origin.x + (screen.width.saturating_sub(size.width) / 2) as i32;
     let y = origin.y + (screen.height.saturating_sub(size.height) / 2) as i32;
@@ -1083,10 +1405,15 @@ fn spawn_ticker_glue(app: AppHandle) {
         let mut shown = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let (Some(main), Some(ticker)) = (app.get_webview_window("main"), app.get_webview_window("ticker")) else {
+            let (Some(main), Some(ticker)) = (
+                app.get_webview_window("main"),
+                app.get_webview_window("ticker"),
+            ) else {
                 continue;
             };
-            let visible = main.is_visible().unwrap_or(false) && TICKER.load(Ordering::Relaxed) && TICKER_BUSY.load(Ordering::Relaxed);
+            let visible = main.is_visible().unwrap_or(false)
+                && TICKER.load(Ordering::Relaxed)
+                && TICKER_BUSY.load(Ordering::Relaxed);
             if !visible {
                 if shown {
                     let _ = ticker.hide();
@@ -1094,7 +1421,11 @@ fn spawn_ticker_glue(app: AppHandle) {
                 }
                 continue;
             }
-            if let (Ok(pos), Ok(size), Ok(dpi)) = (main.outer_position(), main.outer_size(), main.scale_factor()) {
+            if let (Ok(pos), Ok(size), Ok(dpi)) = (
+                main.outer_position(),
+                main.outer_size(),
+                main.scale_factor(),
+            ) {
                 let scale = SCALE_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
                 let height = (170.0 * scale * dpi) as u32;
                 // Under the overlay, unless there is no room under the
@@ -1111,7 +1442,11 @@ fn spawn_ticker_glue(app: AppHandle) {
                 let panel = (PANEL_H.load(Ordering::Relaxed) as f64 * scale * dpi) as i32;
                 let tall = if panel > 0 { panel } else { size.height as i32 };
                 let below = pos.y + tall + 4;
-                let floor = main.current_monitor().ok().flatten().map(|m| m.position().y + m.size().height as i32);
+                let floor = main
+                    .current_monitor()
+                    .ok()
+                    .flatten()
+                    .map(|m| m.position().y + m.size().height as i32);
                 let y = match floor {
                     Some(bottom) if below + height as i32 > bottom => pos.y - height as i32 - 4,
                     _ => below,
@@ -1234,7 +1569,9 @@ fn spawn_stats_pusher(app: AppHandle) {
             let shared = app.state::<Shared>();
             let revision = shared.stats().revision();
 
-            let due = |rev: u64, at: Instant, gap: Duration, beat: Duration| (rev != revision && at.elapsed() >= gap) || at.elapsed() >= beat;
+            let due = |rev: u64, at: Instant, gap: Duration, beat: Duration| {
+                (rev != revision && at.elapsed() >= gap) || at.elapsed() >= beat
+            };
             if due(snap_rev, snap_at, SNAP_MIN_GAP, SNAP_HEARTBEAT) {
                 let status = shared.status().text();
                 let snapshot = shared.stats().snapshot(status);
@@ -1313,7 +1650,10 @@ fn migrate_notable(settings: &mut Settings) {
     for group in &mut settings.notable {
         let joined = group.names.join(",").to_lowercase();
         if GUESSED.contains(&joined.as_str()) {
-            if let Some((_, names)) = stats::default_notable().into_iter().find(|(l, _)| *l == group.label) {
+            if let Some((_, names)) = stats::default_notable()
+                .into_iter()
+                .find(|(l, _)| *l == group.label)
+            {
                 group.names = names;
             }
         }
@@ -1321,8 +1661,20 @@ fn migrate_notable(settings: &mut Settings) {
 }
 
 fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
-    let active = settings.use_filter.then(|| settings.filters.iter().find(|f| f.id == settings.filter)).flatten();
-    let mut notable: Vec<(String, Vec<String>)> = settings.notable.iter().map(|g| (g.label.clone(), g.names.iter().map(|n| n.to_lowercase()).collect())).collect();
+    let active = settings
+        .use_filter
+        .then(|| settings.filters.iter().find(|f| f.id == settings.filter))
+        .flatten();
+    let mut notable: Vec<(String, Vec<String>)> = settings
+        .notable
+        .iter()
+        .map(|g| {
+            (
+                g.label.clone(),
+                g.names.iter().map(|n| n.to_lowercase()).collect(),
+            )
+        })
+        .collect();
     if notable.is_empty() {
         notable = stats::default_notable();
     }
@@ -1330,12 +1682,34 @@ fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
         prefer_ground: settings.sound_on_ground,
         // a rarity dropped from the tracked list must stop alerting even if an
         // older settings file still names it
-        alerts: settings.alerts.iter().filter(|r| stats::JOURNAL_RARITIES.contains(&r.as_str())).cloned().collect(),
+        alerts: settings
+            .alerts
+            .iter()
+            .filter(|r| stats::JOURNAL_RARITIES.contains(&r.as_str()))
+            .cloned()
+            .collect(),
         min_tier: settings.min_tier,
         // the flourish asks a different question of the same drop
-        fx_rarities: if settings.flourish { settings.flourish_rarities.clone() } else { Vec::new() },
+        fx_rarities: if settings.flourish {
+            settings.flourish_rarities.clone()
+        } else {
+            Vec::new()
+        },
         fx_tier: settings.flourish_tier.clamp(1, 6),
         fx_listed: settings.flourish && settings.flourish_listed && settings.use_filter,
+        high_roll_enabled: settings.high_roll_enabled,
+        high_roll_threshold: settings.high_roll_threshold.min(100),
+        stat_alert_rules: settings
+            .stat_alert_rules
+            .iter()
+            .filter(|rule| {
+                rule.enabled
+                    && rule.stat_id.is_some()
+                    && matches!(rule.op.as_str(), "=" | ">" | "<" | "eq" | "gt" | "lt")
+            })
+            .take(128)
+            .cloned()
+            .collect(),
         notable_defs: notable,
         // the rotation asks a different question again, of the zone rather
         // than of a drop
@@ -1346,7 +1720,11 @@ fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
                     .iter()
                     .filter(|l| l.enabled && !l.id.is_empty() && !l.items.is_empty())
                     .map(|l| {
-                        let names = l.items.iter().map(|n| n.trim().to_lowercase()).collect::<Vec<_>>();
+                        let names = l
+                            .items
+                            .iter()
+                            .map(|n| n.trim().to_lowercase())
+                            .collect::<Vec<_>>();
                         (format!("list-{}", l.id), names)
                     })
                     .collect()
@@ -1368,7 +1746,12 @@ fn apply_settings_effects(app: &AppHandle, settings: &Settings) {
     FLOURISH.store(settings.flourish, Ordering::Relaxed);
     FLOURISH_ALWAYS.store(settings.flourish_always, Ordering::Relaxed);
     FLOURISH_ZONE.store(settings.flourish_zone, Ordering::Relaxed);
-    ensure_flourish(app, settings.flourish, settings.flourish_scale.clamp(0.5, 2.0) as f64);
+    ensure_flourish(
+        app,
+        settings.flourish || (settings.debug_mode && settings.twitch_enabled),
+        settings.flourish_scale.clamp(0.5, 2.0) as f64,
+    );
+    twitch_runtime::configure(app, settings);
     if let Some(w) = app.get_webview_window("main") {
         // Click-through is NOT set here, though it used to be, and the comment
         // that stood in its place claimed the poller owned it.
@@ -1385,7 +1768,10 @@ fn apply_settings_effects(app: &AppHandle, settings: &Settings) {
         // The poller reads LOCKED, which is stored above, and converges within
         // one 50ms tick. One writer.
         let _ = w.set_zoom(scale);
-        let _ = w.set_size(LogicalSize::new(BASE_W * scale, overlay_height(settings) * scale));
+        let _ = w.set_size(LogicalSize::new(
+            BASE_W * scale,
+            overlay_height(settings) * scale,
+        ));
     }
     apply_autostart(settings.autostart);
 }
@@ -1494,7 +1880,10 @@ fn spawn_strip_poller(app: AppHandle) {
 fn apply_autostart(enabled: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
-    let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", winreg::enums::KEY_ALL_ACCESS) else {
+    let Ok(run) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        winreg::enums::KEY_ALL_ACCESS,
+    ) else {
         return;
     };
     let _ = run.delete_value("HS Companion"); // pre-rename entry
@@ -1524,14 +1913,23 @@ fn apply_autostart(enabled: bool) {
     }
     // Inside an AppImage the running binary lives on a mount that is gone by
     // the next login; $APPIMAGE is the file the user actually keeps.
-    let target = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+    let target = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
     let Some(target) = target else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
     // Exec is parsed as an argv, so a path with a space has to be quoted, and
     // the spec's own escapes have to survive quoting
-    let quoted = format!("\"{}\"", target.display().to_string().replace('\\', "\\\\").replace('"', "\\\""));
+    let quoted = format!(
+        "\"{}\"",
+        target
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    );
     let desktop = format!("[Desktop Entry]\nType=Application\nName=HS Tracker\nComment=Hero Siege session tracker\nExec={quoted}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n");
     let _ = std::fs::write(entry, desktop);
 }
@@ -1584,7 +1982,22 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<(), String> {
     settings.opacity = settings.opacity.clamp(0.3, 1.0);
     settings.scale = settings.scale.clamp(0.6, 1.5);
     settings.min_tier = settings.min_tier.clamp(0, 20);
-    if !matches!(settings.number_display.as_str(), "standard" | "hero-siege" | "full") {
+    settings.high_roll_threshold = settings.high_roll_threshold.min(100);
+    settings.stat_alert_rules.truncate(128);
+    for rule in &mut settings.stat_alert_rules {
+        rule.id.truncate(64);
+        rule.stat.truncate(96);
+        rule.op = match rule.op.as_str() {
+            "eq" => "=".into(),
+            "gt" => ">".into(),
+            "lt" => "<".into(),
+            _ => rule.op.clone(),
+        };
+    }
+    if !matches!(
+        settings.number_display.as_str(),
+        "standard" | "hero-siege" | "full"
+    ) {
         settings.number_display = "standard".into();
     }
     // Applied before it is written. The other way round, a setting that kills
@@ -1701,6 +2114,8 @@ fn ensure_flourish(app: &AppHandle, wanted: bool, scale: f64) {
         // costs a little memory; a window nobody can close costs the session.
         if existing.is_some() {
             PLACING.store(false, Ordering::Relaxed);
+            set_placement_family(None);
+            set_placement_original(None);
             hide_aux(app, "flourish");
         }
         return;
@@ -1754,6 +2169,7 @@ fn ensure_flourish(app: &AppHandle, wanted: bool, scale: f64) {
 }
 
 fn build_flourish(app: &AppHandle, size: LogicalSize<f64>) {
+    FLOURISH_READY.store(false, Ordering::Release);
     let built = tauri::WebviewWindowBuilder::new(app, "flourish", tauri::WebviewUrl::default())
         .title("HS Tracker Flourish")
         .inner_size(size.width, size.height)
@@ -1779,6 +2195,106 @@ fn build_flourish(app: &AppHandle, size: LogicalSize<f64>) {
     }
 }
 
+/// The page installs its listeners asynchronously after the native window is
+/// built. A test pressed before this handshake is held for it rather than lost.
+#[tauri::command]
+fn flourish_ready() {
+    FLOURISH_READY.store(true, Ordering::Release);
+}
+
+fn valid_flourish_preview(preview: &serde_json::Value) -> bool {
+    preview
+        .get("high_roll")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || preview
+            .get("stat_matches")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|matches| !matches.is_empty())
+}
+
+/// Resolve an alert before it enters the webview queue. A stat match is the
+/// more specific presentation when an item is also a high roll.
+fn flourish_family(preview: &serde_json::Value) -> FlourishFamily {
+    match preview.get("kind").and_then(serde_json::Value::as_str) {
+        Some("zone") => return FlourishFamily::Zone,
+        Some("twitch") => return FlourishFamily::Twitch,
+        _ => {}
+    }
+    if preview
+        .get("stat_matches")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|matches| !matches.is_empty())
+    {
+        FlourishFamily::Stat
+    } else if preview
+        .get("high_roll")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        FlourishFamily::HighRoll
+    } else {
+        FlourishFamily::Loot
+    }
+}
+
+fn tag_flourish_payload(
+    mut payload: serde_json::Value,
+    family: FlourishFamily,
+) -> serde_json::Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("family".into(), family.key().into());
+    }
+    payload
+}
+
+fn emit_flourish_preview(app: &AppHandle, preview: &serde_json::Value) -> bool {
+    if !FLOURISH_READY.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(window) = app.get_webview_window("flourish") else {
+        return false;
+    };
+    let payload = tag_flourish_payload(preview.clone(), flourish_family(preview));
+    if app.emit_to("flourish", "flourish-play", payload).is_err() {
+        return false;
+    }
+    show_flourish(app, &window);
+    true
+}
+
+/// Draw a sample without going through stats, sounds, counters or the journal.
+/// It also works while ordinary flourish alerts are disabled: testing a switch
+/// before turning it on is the useful case, and the temporary window hides when
+/// its own animation finishes.
+#[tauri::command]
+fn test_flourish(app: AppHandle, preview: serde_json::Value) -> Result<(), String> {
+    if !valid_flourish_preview(&preview) {
+        return Err("only high-roll and custom-stat previews are accepted".into());
+    }
+    if !overlay_supported() {
+        return Err("visual alerts are not supported in this session".into());
+    }
+    if emit_flourish_preview(&app, &preview) {
+        return Ok(());
+    }
+
+    let scale = read_settings().flourish_scale.clamp(0.5, 2.0) as f64;
+    ensure_flourish(&app, true, scale);
+    // `ensure_flourish` builds off the event loop on a running app. Wait off
+    // that loop too, both for the window and for the page-ready handshake.
+    std::thread::spawn(move || {
+        for _ in 0..100 {
+            if emit_flourish_preview(&app, &preview) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        log::error("the flourish preview timed out waiting for its window");
+    });
+    Ok(())
+}
+
 /// Whether a drop is worth stopping the screen for, and if so, showing it.
 pub(crate) fn maybe_flourish(app: &AppHandle, drop: &stats::DropEntry) {
     if !FLOURISH.load(Ordering::Relaxed) {
@@ -1786,7 +2302,11 @@ pub(crate) fn maybe_flourish(app: &AppHandle, drop: &stats::DropEntry) {
     }
     // The server announces a find in chat and the client also rolls it on the
     // ground: one item, two sightings, and nobody wants it announced twice.
-    if !drop.name.is_empty() {
+    // A verified roll alert is intentionally a second visual after the ground
+    // alert: the game does not reveal its values until pickup. Identity-based
+    // sets in `GameStats` already prevent duplicates, so this name/time guard
+    // must not swallow the follow-up.
+    if !drop.high_roll && drop.stat_matches.is_empty() && !drop.name.is_empty() {
         static SHOWN: std::sync::Mutex<Vec<(String, Instant)>> = std::sync::Mutex::new(Vec::new());
         if let Ok(mut seen) = SHOWN.lock() {
             seen.retain(|(_, at)| at.elapsed() < Duration::from_secs(20));
@@ -1799,7 +2319,12 @@ pub(crate) fn maybe_flourish(app: &AppHandle, drop: &stats::DropEntry) {
     let Some(w) = app.get_webview_window("flourish") else {
         return;
     };
-    let _ = app.emit_to("flourish", "flourish-play", drop);
+    let Ok(payload) = serde_json::to_value(drop) else {
+        return;
+    };
+    let family = flourish_family(&payload);
+    let payload = tag_flourish_payload(payload, family);
+    let _ = app.emit_to("flourish", "flourish-play", payload);
     show_flourish(app, &w);
 }
 
@@ -1821,9 +2346,11 @@ fn maybe_zone_flourish(app: &AppHandle, zone: &stats::SatanicZone) {
     // and this side has no other use for.
     let payload = serde_json::json!({
         "kind": "zone",
+        "family": FlourishFamily::Zone.key(),
         "zone": zone.zone,
         "buffs": zone.buffs,
         "debuffs": zone.debuffs,
+        "colossal_chest": zone.colossal_chest,
     });
     let _ = app.emit_to("flourish", "flourish-play", &payload);
     show_flourish(app, &w);
@@ -1858,6 +2385,14 @@ fn flourish_done(app: AppHandle) {
 /// While a flourish is being placed it stays on screen, takes the mouse and
 /// loops, so it can be dragged where the player wants it.
 static PLACING: AtomicBool = AtomicBool::new(false);
+/// The family whose point is being edited. Kept separately from the window's
+/// generic parked point so the legacy close/Done button can save the right map
+/// entry without receiving another argument.
+static PLACING_FAMILY: std::sync::Mutex<Option<FlourishFamily>> = std::sync::Mutex::new(None);
+/// Where the shared window stood before placement borrowed it. Cancel restores
+/// this point without changing any family setting.
+static PLACING_ORIGINAL: std::sync::Mutex<Option<tauri::PhysicalPosition<i32>>> =
+    std::sync::Mutex::new(None);
 /// Which placement is current. A placement that outlives its welcome is ended
 /// from here rather than by the window, because the whole trouble with a window
 /// that takes the mouse is that it might be the thing not answering.
@@ -1873,31 +2408,165 @@ const PLACING_LIMIT: Duration = Duration::from_secs(180);
 fn park_below_centre(app: &AppHandle, w: &tauri::WebviewWindow) {
     let Ok(Some(mon)) = w.current_monitor().or_else(|_| app.primary_monitor()) else {
         let _ = w.center();
+        if let Ok(position) = w.outer_position() {
+            park("flourish", position);
+        }
         return;
     };
     let (pos, size) = (mon.position(), mon.size());
-    let win = w.outer_size().unwrap_or(tauri::PhysicalSize { width: 480, height: 240 });
+    let win = w.outer_size().unwrap_or(tauri::PhysicalSize {
+        width: 480,
+        height: 240,
+    });
     let x = pos.x + (size.width as i32 - win.width as i32) / 2;
     let y = pos.y + (size.height as i32 - win.height as i32) / 2 + (size.height as i32) / 5;
-    let _ = w.set_position(tauri::PhysicalPosition { x, y });
+    let position = tauri::PhysicalPosition { x, y };
+    park("flourish", position);
+    let _ = w.set_position(position);
 }
 
-#[tauri::command]
-fn place_flourish(app: AppHandle, placing: bool) {
-    let Some(w) = app.get_webview_window("flourish") else {
-        // Nothing to place. Saying so beats setting the flag and leaving the
-        // app in a mode it cannot be talked out of.
-        PLACING.store(false, Ordering::Relaxed);
-        return;
-    };
-    PLACING.store(placing, Ordering::Relaxed);
-    if placing {
-        // It has never been put anywhere, so it goes in the middle rather than
-        // wherever the window manager fancies — which on a first run has been
-        // on top of the dashboard, over the buttons, invisible.
-        if parked("flourish").is_none() {
-            park_below_centre(&app, &w);
+fn move_flourish_to_family(
+    app: &AppHandle,
+    w: &tauri::WebviewWindow,
+    family: FlourishFamily,
+) -> Result<FlourishPosition, String> {
+    let legacy = parked("flourish");
+    if let Some(legacy) = legacy {
+        seed_parked_flourish_positions(legacy);
+    }
+    let configured = parked(family.position_key());
+    let position = configured
+        .filter(|position| on_a_monitor(app, *position))
+        .or_else(|| legacy.filter(|position| on_a_monitor(app, *position)))
+        .or_else(|| {
+            park_below_centre(app, w);
+            parked("flourish")
+        })
+        .ok_or_else(|| "The visual-alert window has no usable desktop position".to_owned())?;
+    seed_parked_flourish_positions(position);
+    // `reveal` reapplies the generic parked point after mapping the window, so
+    // make the selected family that point before either path shows it.
+    park("flourish", position);
+    w.set_position(position)
+        .map_err(|error| error.to_string())?;
+    Ok(position.into())
+}
+
+fn seed_parked_flourish_positions(position: tauri::PhysicalPosition<i32>) {
+    for family in FLOURISH_FAMILIES {
+        if parked(family.position_key()).is_none() {
+            park(family.position_key(), position);
         }
+    }
+}
+
+/// Commit family geometry as one positions.json replacement. PARKED changes
+/// only after the atomic rename succeeds, so a failed Save can leave placement
+/// active without Cancel later leaking an uncommitted coordinate.
+fn persist_flourish_position(
+    app: &AppHandle,
+    selected: FlourishFamily,
+    position: tauri::PhysicalPosition<i32>,
+    apply_all: bool,
+) -> Result<(), String> {
+    if !can_place_windows() {
+        return Err("Window placement is not available in this session".into());
+    }
+    let mut map = window_positions(app);
+    set_flourish_position_values(&mut map, selected, position, apply_all);
+    let json = serde_json::to_vec(&map).map_err(|error| error.to_string())?;
+    write_atomic(&positions_path(), &json).map_err(|error| error.to_string())?;
+    for family in flourish_position_targets(selected, apply_all) {
+        park(family.position_key(), position);
+    }
+    Ok(())
+}
+
+/// Move the shared flourish window only when the renderer actually dequeues an
+/// alert. Moving at native emit time would drag the alert already on screen
+/// when a later family joins the queue.
+#[tauri::command]
+fn position_flourish(app: AppHandle, family: String) -> Result<FlourishPosition, String> {
+    let family = FlourishFamily::parse(&family)
+        .ok_or_else(|| format!("Unknown visual-alert family: {family}"))?;
+    let w = app
+        .get_webview_window("flourish")
+        .ok_or_else(|| "The visual-alert window is not available".to_owned())?;
+    let position = move_flourish_to_family(&app, &w, family)?;
+    if !PLACING.load(Ordering::Relaxed) {
+        show_flourish(&app, &w);
+    }
+    Ok(position)
+}
+
+fn placement_family() -> Option<FlourishFamily> {
+    PLACING_FAMILY.lock().ok().and_then(|family| *family)
+}
+
+fn set_placement_family(family: Option<FlourishFamily>) {
+    if let Ok(mut selected) = PLACING_FAMILY.lock() {
+        *selected = family;
+    }
+}
+
+fn placement_original() -> Option<tauri::PhysicalPosition<i32>> {
+    PLACING_ORIGINAL.lock().ok().and_then(|position| *position)
+}
+
+fn set_placement_original(position: Option<tauri::PhysicalPosition<i32>>) {
+    if let Ok(mut original) = PLACING_ORIGINAL.lock() {
+        *original = position;
+    }
+}
+
+/// Placement is an async Tauri command, so this wait runs on its worker rather
+/// than the window event loop. The page-ready half matters as much as the
+/// native handle: `flourish-placing` is otherwise emitted before Svelte has
+/// installed its listener and the newly visible window never draws a sample.
+fn flourish_window_for_placement(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    if !overlay_supported() {
+        return Err("Visual alerts are not supported in this session".into());
+    }
+    let scale = read_settings().flourish_scale.clamp(0.5, 2.0) as f64;
+    ensure_flourish(app, true, scale);
+    for _ in 0..100 {
+        if FLOURISH_READY.load(Ordering::Acquire) {
+            if let Some(window) = app.get_webview_window("flourish") {
+                return Ok(window);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("The visual-alert window did not finish starting".into())
+}
+
+/// Backward compatible with the original `{ placing }` command. New callers
+/// select a family when placement starts; stopping captures that point, and
+/// `applyAll` copies the same physical coordinates to every family. `cancel`
+/// restores the point that was on screen before placement and writes nothing.
+#[tauri::command(async)]
+fn place_flourish(
+    app: AppHandle,
+    placing: bool,
+    family: Option<String>,
+    apply_all: Option<bool>,
+    cancel: Option<bool>,
+) -> Result<(), String> {
+    if placing {
+        let family = family.as_deref().unwrap_or(FlourishFamily::Loot.key());
+        let family = FlourishFamily::parse(family)
+            .ok_or_else(|| format!("Unknown visual-alert family: {family}"))?;
+        let w = flourish_window_for_placement(&app)?;
+        let beginning = !PLACING.load(Ordering::Relaxed);
+        let original = if beginning { parked("flourish") } else { None };
+        move_flourish_to_family(&app, &w, family)?;
+        if beginning {
+            // On a first run there is no meaningful hidden-window coordinate;
+            // the computed default is the point Cancel should return to.
+            set_placement_original(original.or_else(|| parked("flourish")));
+        }
+        set_placement_family(Some(family));
+        PLACING.store(true, Ordering::Relaxed);
         reveal(&app, "flourish", false);
         // While it is being placed it is an ordinary window: it takes the
         // mouse, and it has to be able to take the keyboard too, or its own
@@ -1905,18 +2574,62 @@ fn place_flourish(app: AppHandle, placing: bool) {
         let _ = w.set_focusable(true);
         set_click_through(&w, false);
         let _ = w.set_focus();
-        let _ = app.emit_to("flourish", "flourish-placing", true);
+        let _ = app.emit_to(
+            "flourish",
+            "flourish-placing",
+            serde_json::json!({ "placing": true, "family": family.key() }),
+        );
         let mine = PLACING_GEN.fetch_add(1, Ordering::Relaxed) + 1;
         let later = app.clone();
         std::thread::spawn(move || {
             std::thread::sleep(PLACING_LIMIT);
             if PLACING.load(Ordering::Relaxed) && PLACING_GEN.load(Ordering::Relaxed) == mine {
-                place_flourish(later, false);
+                let _ = place_flourish(later, false, None, None, Some(true));
             }
         });
+        Ok(())
     } else {
+        let Some(w) = app.get_webview_window("flourish") else {
+            // Nothing to end. Clear the native mode rather than leave a
+            // mouse-grabbing placement active in state after its window died.
+            PLACING.store(false, Ordering::Relaxed);
+            set_placement_family(None);
+            set_placement_original(None);
+            return Err("The visual-alert window is not available".into());
+        };
+        let selected = match family {
+            Some(family) => FlourishFamily::parse(&family)
+                .ok_or_else(|| format!("Unknown visual-alert family: {family}"))?,
+            None => placement_family().unwrap_or(FlourishFamily::Loot),
+        };
+        let was_placing = PLACING.load(Ordering::Relaxed);
+        let cancelled = cancel.unwrap_or(false);
+        let position = if was_placing && !cancelled {
+            Some(
+                w.outer_position()
+                    .map_err(|_| "The visual-alert window position could not be read")?,
+            )
+        } else {
+            None
+        };
+        // Save is the commit boundary. Until its atomic rename succeeds the
+        // overlay remains draggable, the watchdog remains current, and no
+        // `{ placing:false }` event is emitted; the user can retry or Cancel.
+        if let Some(position) = position {
+            persist_flourish_position(&app, selected, position, apply_all.unwrap_or(false))?;
+        }
+
+        PLACING.store(false, Ordering::Relaxed);
         PLACING_GEN.fetch_add(1, Ordering::Relaxed);
-        let _ = app.emit_to("flourish", "flourish-placing", false);
+        let original = placement_original();
+        set_placement_family(None);
+        set_placement_original(None);
+        if cancelled {
+            if let Some(original) = original.filter(|position| on_a_monitor(&app, *position)) {
+                park("flourish", original);
+                let _ = w.set_position(original);
+            }
+        }
         set_click_through(&w, true);
         let _ = w.set_focusable(false);
         if FLOURISH_ALWAYS.load(Ordering::Relaxed) {
@@ -1924,6 +2637,15 @@ fn place_flourish(app: AppHandle, placing: bool) {
         } else {
             hide_aux(&app, "flourish");
         }
+        // Tell the renderer only after the placement window has been hidden.
+        // It may immediately dequeue a held live alert and `position_flourish`
+        // must be the last native operation that moves/shows that playback.
+        let _ = app.emit_to(
+            "flourish",
+            "flourish-placing",
+            serde_json::json!({ "placing": false, "family": selected.key() }),
+        );
+        Ok(())
     }
 }
 
@@ -2001,10 +2723,14 @@ fn show_log() -> Result<(), String> {
     #[cfg(windows)]
     let spawned = {
         use std::os::windows::process::CommandExt as _;
-        std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", file.display())).spawn()
+        std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", file.display()))
+            .spawn()
     };
     #[cfg(not(windows))]
-    let spawned = std::process::Command::new("xdg-open").arg(file.parent().unwrap_or(&file)).spawn();
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(file.parent().unwrap_or(&file))
+        .spawn();
     reap(spawned).map_err(|e| e.to_string())
 }
 
@@ -2037,17 +2763,42 @@ fn about() -> About {
     }
 }
 
-/// Open a link in whatever browser the desktop uses.
+fn allowed_external_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return false;
+    }
+    match url.host_str() {
+        Some("github.com") => {
+            url.path() == "/Parazeya/hs-tracker" || url.path().starts_with("/Parazeya/hs-tracker/")
+        }
+        Some("twitch.tv" | "www.twitch.tv") => {
+            url.path().trim_end_matches('/') == "/activate"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Open one of the app's allowlisted links in the desktop browser.
 ///
-/// Only ever this project's own pages: the address arrives from the web side,
-/// and handing an arbitrary string to a shell is how a link becomes a command.
+/// The Twitch Device Code flow returns its public activation page. Keep that
+/// exception exact, and launch URLs as one process argument rather than
+/// interpolating them into a command shell.
 #[tauri::command(async)]
 fn open_url(url: String) -> Result<(), String> {
-    if !url.starts_with(REPO) {
-        return Err("that is not one of this project's pages".into());
+    if !allowed_external_url(&url) {
+        return Err("that external page is not allowlisted".into());
     }
     #[cfg(windows)]
-    let spawned = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    let spawned = std::process::Command::new("explorer.exe").arg(&url).spawn();
     #[cfg(not(windows))]
     let spawned = std::process::Command::new("xdg-open").arg(&url).spawn();
     reap(spawned).map_err(|e| e.to_string())
@@ -2062,7 +2813,9 @@ fn fit_overlay(app: AppHandle, height: f64, width: Option<f64>) {
     if let Some(w) = width {
         remember_width(w);
     }
-    let Some(w) = app.get_webview_window("main") else { return };
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
     let scale = SCALE_MILLI.load(Ordering::Relaxed) as f64 / 1000.0;
     let wanted = LogicalSize::new(base_w() * scale, height.max(STRIP_H) * scale);
     // a resize that changes nothing still goes through the window manager, and
@@ -2085,7 +2838,8 @@ fn hide_window(app: AppHandle) {
 /// and a window manager is free to place it afresh when it comes back — KWin
 /// centres it, which drags the overlay out from the corner the player put it
 /// in. Windows keeps the position by itself; restoring it there costs nothing.
-static PARKED: std::sync::Mutex<Vec<(String, tauri::PhysicalPosition<i32>)>> = std::sync::Mutex::new(Vec::new());
+static PARKED: std::sync::Mutex<Vec<(String, tauri::PhysicalPosition<i32>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn park(label: &str, pos: tauri::PhysicalPosition<i32>) {
     let Ok(mut parked) = PARKED.lock() else {
@@ -2150,7 +2904,10 @@ fn on_a_monitor(app: &AppHandle, pos: tauri::PhysicalPosition<i32>) -> bool {
     monitors.is_empty()
         || monitors.iter().any(|m| {
             let (p, s) = (m.position(), m.size());
-            pos.x >= p.x - 50 && pos.x < p.x + s.width as i32 && pos.y >= p.y - 50 && pos.y < p.y + s.height as i32
+            pos.x >= p.x - 50
+                && pos.x < p.x + s.width as i32
+                && pos.y >= p.y - 50
+                && pos.y < p.y + s.height as i32
         })
 }
 
@@ -2179,7 +2936,10 @@ pub(crate) fn show_overlay(app: &AppHandle) {
     // A dashboard the player deliberately launched or opened is already the
     // app's visible face; revealing the overlay beside it produced two HS
     // Tracker windows until Compact mode happened to hide the dashboard.
-    if app.get_webview_window("dashboard").is_some_and(|window| on_screen(&window)) {
+    if app
+        .get_webview_window("dashboard")
+        .is_some_and(|window| on_screen(&window))
+    {
         return;
     }
     reveal(app, "main", false);
@@ -2211,7 +2971,11 @@ fn hide_dashboard(app: AppHandle) {
 fn set_face(app: &AppHandle, compact: bool) {
     let possible = overlay_supported();
     let shown = compact && possible;
-    let (show, hide) = if shown { ("main", "dashboard") } else { ("dashboard", "main") };
+    let (show, hide) = if shown {
+        ("main", "dashboard")
+    } else {
+        ("dashboard", "main")
+    };
     hide_aux(app, hide);
     show_aux(app, show);
     // What the user asked for is what is remembered. A session that cannot host
@@ -2311,7 +3075,9 @@ fn write_sound(dir: &std::path::Path, key: &str, snd: &ExportedSound) -> Result<
     if !sound_key(key) || !SOUND_EXTS.iter().any(|(e, _)| *e == snd.ext) {
         return Err("not a sound this app files".into());
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&snd.data).map_err(|e| e.to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&snd.data)
+        .map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // One key, one file — the rule `pick_sound` and `clear_sound` both keep.
     // Every reader takes the first extension of SOUND_EXTS that exists, so
@@ -2346,7 +3112,8 @@ fn copy_sound(app: AppHandle, from: String, to: String) -> Result<(), String> {
         let source = sounds_dir().join(format!("{from}.{ext}"));
         if source.exists() {
             std::fs::create_dir_all(sounds_dir()).map_err(|e| e.to_string())?;
-            std::fs::copy(&source, sounds_dir().join(format!("{to}.{ext}"))).map_err(|e| e.to_string())?;
+            std::fs::copy(&source, sounds_dir().join(format!("{to}.{ext}")))
+                .map_err(|e| e.to_string())?;
             let _ = app.emit("sounds-changed", &to);
             break;
         }
@@ -2363,9 +3130,24 @@ fn copy_sound(app: AppHandle, from: String, to: String) -> Result<(), String> {
 #[tauri::command(async)]
 fn export_filter(app: AppHandle, filter: SoundFilter) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let safe: String = filter.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '-' }).collect();
+    let safe: String = filter
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
     let suggested = format!("{safe}.hstracker.json");
-    let picked = app.dialog().file().add_filter("HS Tracker filter", &["json"]).set_file_name(&suggested).blocking_save_file();
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("HS Tracker filter", &["json"])
+        .set_file_name(&suggested)
+        .blocking_save_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
@@ -2387,7 +3169,12 @@ fn export_filter(app: AppHandle, filter: SoundFilter) -> Result<Option<String>, 
     };
     let json = serde_json::to_string_pretty(&exported).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(Some(path.file_name().unwrap_or_default().to_string_lossy().into_owned()))
+    Ok(Some(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    ))
 }
 
 /// Everything the app remembers, in one file.
@@ -2447,19 +3234,29 @@ fn export_settings(app: AppHandle) -> Result<Option<String>, String> {
     };
     let json = serde_json::to_string_pretty(&exported).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(Some(path.file_name().unwrap_or_default().to_string_lossy().into_owned()))
+    Ok(Some(
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    ))
 }
 
 /// Off the main thread; see `export_filter`.
 #[tauri::command(async)]
 fn import_settings(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app.dialog().file().add_filter("HS Tracker settings", &["json"]).blocking_pick_file();
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("HS Tracker settings", &["json"])
+        .blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let exported: ExportedSettings = serde_json::from_str(&text).map_err(|_| "not an HS Tracker settings file".to_string())?;
+    let exported: ExportedSettings =
+        serde_json::from_str(&text).map_err(|_| "not an HS Tracker settings file".to_string())?;
     if exported.app != "hs-tracker" || exported.kind != "settings" {
         return Err("not an HS Tracker settings file".into());
     }
@@ -2468,7 +3265,11 @@ fn import_settings(app: AppHandle) -> Result<Option<String>, String> {
     for (key, snd) in &exported.sounds {
         let _ = write_sound(&sounds_dir(), key, snd);
     }
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     save_settings(app, exported.settings)?;
     Ok(Some(name))
 }
@@ -2477,12 +3278,17 @@ fn import_settings(app: AppHandle) -> Result<Option<String>, String> {
 #[tauri::command(async)]
 fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
     use tauri_plugin_dialog::DialogExt;
-    let picked = app.dialog().file().add_filter("HS Tracker filter", &["json"]).blocking_pick_file();
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("HS Tracker filter", &["json"])
+        .blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let exported: ExportedFilter = serde_json::from_str(&text).map_err(|_| "not an HS Tracker filter".to_string())?;
+    let exported: ExportedFilter =
+        serde_json::from_str(&text).map_err(|_| "not an HS Tracker filter".to_string())?;
     if exported.app != "hs-tracker" {
         return Err("not an HS Tracker filter".into());
     }
@@ -2493,9 +3299,15 @@ fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
         // that is already installed
         let id = format!("{:x}", now_id());
         if let Some(sound) = list.sound {
-            if let (true, Ok(bytes)) = (SOUND_EXTS.iter().any(|(e, _)| *e == sound.ext), base64::engine::general_purpose::STANDARD.decode(sound.data)) {
+            if let (true, Ok(bytes)) = (
+                SOUND_EXTS.iter().any(|(e, _)| *e == sound.ext),
+                base64::engine::general_purpose::STANDARD.decode(sound.data),
+            ) {
                 if bytes.len() <= 10 << 20 {
-                    let _ = std::fs::write(sounds_dir().join(format!("list-{id}.{}", sound.ext)), bytes);
+                    let _ = std::fs::write(
+                        sounds_dir().join(format!("list-{id}.{}", sound.ext)),
+                        bytes,
+                    );
                 }
             }
         }
@@ -2518,7 +3330,9 @@ fn import_filter(app: AppHandle) -> Result<Option<SoundFilter>, String> {
 fn now_id() -> u64 {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
     nanos.wrapping_add(SEQ.fetch_add(1, Ordering::Relaxed)) & 0xffff_ffff
 }
 
@@ -2594,9 +3408,21 @@ fn log_environment() {
     let windows = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
         .map(|key| {
-            let text = |name: &str| key.get_value::<String, _>(name).unwrap_or_else(|_| "-".into());
-            let patch = key.get_value::<u32, _>("UBR").map(|n| n.to_string()).unwrap_or_else(|_| "-".into());
-            format!("{} {} build {}.{}", text("ProductName"), text("DisplayVersion"), text("CurrentBuild"), patch)
+            let text = |name: &str| {
+                key.get_value::<String, _>(name)
+                    .unwrap_or_else(|_| "-".into())
+            };
+            let patch = key
+                .get_value::<u32, _>("UBR")
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "-".into());
+            format!(
+                "{} {} build {}.{}",
+                text("ProductName"),
+                text("DisplayVersion"),
+                text("CurrentBuild"),
+                patch
+            )
         })
         .unwrap_or_else(|e| format!("Windows (unreadable: {e})"));
 
@@ -2605,7 +3431,9 @@ fn log_environment() {
     // be running a version nobody has ever tested against.
     let webview = tauri::webview_version().unwrap_or_else(|e| format!("unreadable ({e})"));
 
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "-".into());
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "-".into());
 
     // Written to, not asked about. A folder can exist, list fine and still
     // refuse a write — an install under Program Files does exactly that, and
@@ -2649,7 +3477,10 @@ fn retry_without_dmabuf() -> bool {
         return false;
     }
     // inside an AppImage the mounted binary is not what the user keeps
-    let Some(exe) = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()) else {
+    let Some(exe) = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
         return false;
     };
     log::warn("nothing was drawn in 20s - restarting once with the DMA-BUF renderer off");
@@ -2658,7 +3489,10 @@ fn retry_without_dmabuf() -> bool {
     handing_over();
     // The environment carries over as it stands, the GTK backend with it. The
     // marker only stops the backend logic relaunching a second time on top.
-    match std::process::Command::new(exe).env("HS_TRACKER_RELAUNCHED", "1").spawn() {
+    match std::process::Command::new(exe)
+        .env("HS_TRACKER_RELAUNCHED", "1")
+        .spawn()
+    {
         Ok(_) => true,
         Err(e) => {
             log::error(format!("could not restart: {e}"));
@@ -2710,12 +3544,19 @@ fn ticker_busy(active: bool) {
 
 #[tauri::command(async)]
 fn get_shopping() -> Vec<String> {
-    std::fs::read_to_string(shopping_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    std::fs::read_to_string(shopping_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 #[tauri::command(async)]
 fn set_shopping(items: Vec<String>) -> Result<(), String> {
-    let items: Vec<String> = items.into_iter().filter(|s| !s.trim().is_empty()).take(200).collect();
+    let items: Vec<String> = items
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .take(200)
+        .collect();
     let json = serde_json::to_vec_pretty(&items).map_err(|e| e.to_string())?;
     write_atomic(&shopping_path(), &json).map_err(|e| e.to_string())
 }
@@ -2729,9 +3570,13 @@ fn copy_text(text: String) -> Result<(), String> {
 }
 
 /// One clipboard, opened once. Both the shopping list and the run card use it.
-fn with_clipboard<T>(job: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, String> {
+fn with_clipboard<T>(
+    job: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, String> {
     static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
-    let mut guard = CLIPBOARD.lock().map_err(|_| "the clipboard is busy".to_string())?;
+    let mut guard = CLIPBOARD
+        .lock()
+        .map_err(|_| "the clipboard is busy".to_string())?;
     if guard.is_none() {
         *guard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
     }
@@ -2745,7 +3590,9 @@ fn with_clipboard<T>(job: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arbo
 /// carries JSON and a megabyte of numbers spelled out is not that.
 #[tauri::command]
 fn copy_image(width: u32, height: u32, rgba: String) -> Result<(), String> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(rgba).map_err(|_| "the picture did not survive the trip".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(rgba)
+        .map_err(|_| "the picture did not survive the trip".to_string())?;
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || bytes.len() != w * h * 4 {
         return Err("the picture is not the size it says it is".into());
@@ -2799,7 +3646,10 @@ fn sound_status(rarity: String) -> Option<String> {
     if !sound_key(&rarity) {
         return None;
     }
-    SOUND_EXTS.iter().map(|(ext, _)| format!("{rarity}.{ext}")).find(|name| sounds_dir().join(name).exists())
+    SOUND_EXTS
+        .iter()
+        .map(|(ext, _)| format!("{rarity}.{ext}"))
+        .find(|name| sounds_dir().join(name).exists())
 }
 
 /// Native picker + copy into sounds\; the webview's own file input is
@@ -2811,11 +3661,19 @@ fn pick_sound(app: AppHandle, rarity: String) -> Result<Option<String>, String> 
     if !sound_key(&rarity) {
         return Err("bad rarity".into());
     }
-    let picked = app.dialog().file().add_filter("Audio", &["mp3", "wav", "ogg", "flac"]).blocking_pick_file();
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Audio", &["mp3", "wav", "ogg", "flac"])
+        .blocking_pick_file();
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
         return Ok(None);
     };
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
     if !SOUND_EXTS.iter().any(|(e, _)| *e == ext) {
         return Err("unsupported format (mp3/wav/ogg/flac)".into());
     }
@@ -2889,7 +3747,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&dashboard, &compact, &lock, &pause, &reset, &quit])?;
     TrayIconBuilder::with_id("main")
-        .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+        .icon(tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray.png"
+        ))?)
         .tooltip("HS Tracker")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -2949,11 +3809,16 @@ fn honour_backend_choice() {
         return; // no XWayland here at all
     }
     let _ = std::fs::write(&breadcrumb, "");
-    let started = std::process::Command::new(std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).unwrap_or_default())
-        .env("GDK_BACKEND", "x11")
-        .env("HS_TRACKER_RELAUNCHED", "1")
-        .spawn()
-        .is_ok();
+    let started = std::process::Command::new(
+        std::env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_default(),
+    )
+    .env("GDK_BACKEND", "x11")
+    .env("HS_TRACKER_RELAUNCHED", "1")
+    .spawn()
+    .is_ok();
     if started {
         std::process::exit(0);
     }
@@ -2998,7 +3863,9 @@ fn ease_webkit() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some() {
         return;
     }
-    let nvidia = ["/dev/nvidiactl", "/sys/module/nvidia/version"].iter().any(|p| std::path::Path::new(p).exists());
+    let nvidia = ["/dev/nvidiactl", "/sys/module/nvidia/version"]
+        .iter()
+        .any(|p| std::path::Path::new(p).exists());
 
     let painting = data_dir().join("no-paint");
     let soft = data_dir().join("soft-render");
@@ -3006,7 +3873,10 @@ fn ease_webkit() {
     // as far as drawing. Once is enough to stop trying.
     if painting.exists() && !soft.exists() {
         let _ = std::fs::write(&soft, "the DMA-BUF renderer drew nothing on this machine\n");
-        log::say("start", "nothing was drawn last time; the DMA-BUF renderer is off from now on");
+        log::say(
+            "start",
+            "nothing was drawn last time; the DMA-BUF renderer is off from now on",
+        );
     }
     let _ = std::fs::write(&painting, "");
 
@@ -3034,7 +3904,11 @@ pub fn run() {
         // its arguments over and leaves, and the copy already running comes to
         // the front instead.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            let face = if read_settings().compact && overlay_supported() { "main" } else { "dashboard" };
+            let face = if read_settings().compact && overlay_supported() {
+                "main"
+            } else {
+                "dashboard"
+            };
             reveal(app, face, true);
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -3057,6 +3931,7 @@ pub fn run() {
                 .build(),
         )
         .manage(Shared::default())
+        .manage(twitch_runtime::TwitchRuntime::default())
         .invoke_handler(tauri::generate_handler![
             snapshot,
             get_extra,
@@ -3069,7 +3944,16 @@ pub fn run() {
             open_url,
             fit_overlay,
             flourish_done,
+            flourish_ready,
             place_flourish,
+            position_flourish,
+            test_flourish,
+            twitch_runtime::twitch_status,
+            twitch_runtime::twitch_begin_auth,
+            twitch_runtime::twitch_poll_auth,
+            twitch_runtime::twitch_disconnect,
+            twitch_runtime::twitch_restart,
+            twitch_runtime::twitch_test_alert,
             hide_window,
             hide_dashboard,
             compact_mode,
@@ -3122,7 +4006,10 @@ pub fn run() {
                     }
                 }
             } else {
-                log::say("info", "wayland session: running as the dashboard, without the overlay");
+                log::say(
+                    "info",
+                    "wayland session: running as the dashboard, without the overlay",
+                );
             }
             let settings = read_settings();
             app.state::<Shared>().stats().restore(&read_carried());
@@ -3164,7 +4051,9 @@ pub fn run() {
             // and is re-delivered as base64 over IPC. Granted here, by path.
             {
                 use tauri::Manager as _;
-                let _ = app.asset_protocol_scope().allow_directory(sounds_dir(), false);
+                let _ = app
+                    .asset_protocol_scope()
+                    .allow_directory(sounds_dir(), false);
             }
             spawn_render_watchdog(app.handle().clone());
             spawn_position_saver(app.handle().clone());
@@ -3191,7 +4080,9 @@ pub fn run() {
                 // drop re-shows a mouse-grabbing dashed frame over the game.
                 if label == "flourish" && PLACING.load(Ordering::Relaxed) {
                     api.prevent_close();
-                    place_flourish(app, false);
+                    std::thread::spawn(move || {
+                        let _ = place_flourish(app, false, None, None, Some(true));
+                    });
                     return;
                 }
                 // Hiding is only kind while there is somewhere to hide into.
@@ -3224,6 +4115,7 @@ pub fn run() {
             RUNNING.store(true, Ordering::Relaxed);
         }
         if let tauri::RunEvent::Exit = event {
+            twitch_runtime::shutdown(app);
             save_window_positions(app);
             save_carried(app);
             // quitting mid-run still files it
@@ -3235,6 +4127,24 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_links_are_narrowly_allowlisted() {
+        assert!(allowed_external_url(REPO));
+        assert!(allowed_external_url(&format!("{REPO}/releases/latest")));
+        assert!(allowed_external_url("https://www.twitch.tv/activate"));
+        assert!(allowed_external_url("https://twitch.tv/activate/"));
+
+        assert!(!allowed_external_url("http://www.twitch.tv/activate"));
+        assert!(!allowed_external_url(
+            "https://www.twitch.tv/activate?device_code=secret"
+        ));
+        assert!(!allowed_external_url("https://www.twitch.tv/settings"));
+        assert!(!allowed_external_url(
+            "https://github.com/Parazeya/hs-tracker.evil"
+        ));
+        assert!(!allowed_external_url("https://example.com/activate"));
+    }
 
     /// The strip follows the panel's edge instead of remembering where it was.
     ///
@@ -3262,7 +4172,11 @@ mod tests {
         remember_width(520.4);
         assert_eq!(panel_w(), 520.0);
         let (x0, _, x1, _) = strip_rect(false);
-        assert_eq!((x0, x1 - x0), (520.0, STRIP_W), "the strip is beside the panel, not on it");
+        assert_eq!(
+            (x0, x1 - x0),
+            (520.0, STRIP_W),
+            "the strip is beside the panel, not on it"
+        );
 
         // a page mid-layout reports nothing useful, and the window must not
         // shrink to it and clip the panel
@@ -3275,7 +4189,11 @@ mod tests {
             );
         }
         remember_width(9000.0);
-        assert_eq!(panel_w(), 1600.0, "and nothing legitimate is wider than this");
+        assert_eq!(
+            panel_w(),
+            1600.0,
+            "and nothing legitimate is wider than this"
+        );
 
         PANEL_WIDTH.store(before, Ordering::Relaxed);
     }
@@ -3287,10 +4205,29 @@ mod tests {
     /// reason: nothing about a wrong answer here is loud.
     #[test]
     fn a_sound_key_cannot_walk_out_of_its_directory() {
-        for good in ["satanic", "set", "heroic", "angelic", "unholy", "mail", "zone", "list-9f3a2b", "list-a-b"] {
+        for good in [
+            "satanic",
+            "set",
+            "heroic",
+            "angelic",
+            "unholy",
+            "mail",
+            "zone",
+            "list-9f3a2b",
+            "list-a-b",
+        ] {
             assert!(sound_key(good), "{good} should be allowed");
         }
-        for bad in ["list-../../etc/passwd", "list-a/b", "list-a\\b", "../satanic", "list-a.b", "", "satanic ", "LIST-abc/.."] {
+        for bad in [
+            "list-../../etc/passwd",
+            "list-a/b",
+            "list-a\\b",
+            "../satanic",
+            "list-a.b",
+            "",
+            "satanic ",
+            "LIST-abc/..",
+        ] {
             assert!(!sound_key(bad), "{bad:?} should be refused");
         }
         // and the length ceiling, which is what stops a very long id at all
@@ -3313,8 +4250,14 @@ mod tests {
         };
         write_sound(&dir, "satanic", &imported).unwrap();
 
-        assert!(!dir.join("satanic.mp3").exists(), "mp3 comes first and would shadow the wav");
-        assert_eq!(std::fs::read(dir.join("satanic.wav")).unwrap(), b"the imported one");
+        assert!(
+            !dir.join("satanic.mp3").exists(),
+            "mp3 comes first and would shadow the wav"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("satanic.wav")).unwrap(),
+            b"the imported one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3332,14 +4275,190 @@ mod tests {
         std::fs::write(&path, wreck).unwrap();
 
         let settings: Settings = read_json_or_default(&path);
-        assert_eq!(settings.min_tier, Settings::default().min_tier, "defaults, as before");
-        assert!(!path.exists(), "and not left where the next save overwrites it");
-        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bad")).unwrap(), wreck, "the user's own file, kept whole");
+        assert_eq!(
+            settings.min_tier,
+            Settings::default().min_tier,
+            "defaults, as before"
+        );
+        assert!(
+            !path.exists(),
+            "and not left where the next save overwrites it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.json.bad")).unwrap(),
+            wreck,
+            "the user's own file, kept whole"
+        );
 
         // a file that is simply not there is a first run, and stays quiet
         let fresh: Settings = read_json_or_default(&dir.join("nothing.json"));
         assert_eq!(fresh.min_tier, Settings::default().min_tier);
         assert!(!dir.join("nothing.json.bad").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flourish_tests_only_accept_preview_alert_shapes() {
+        assert!(valid_flourish_preview(
+            &serde_json::json!({ "high_roll": true })
+        ));
+        assert!(valid_flourish_preview(&serde_json::json!({
+            "stat_matches": [{ "stat_id": 70, "actual": 3, "op": ">", "target": 2 }]
+        })));
+        assert!(!valid_flourish_preview(
+            &serde_json::json!({ "high_roll": false })
+        ));
+        assert!(!valid_flourish_preview(
+            &serde_json::json!({ "stat_matches": [] })
+        ));
+        assert!(!valid_flourish_preview(
+            &serde_json::json!({ "kind": "zone" })
+        ));
+    }
+
+    #[test]
+    fn flourish_families_are_strict_and_specific_alerts_win() {
+        for (key, family) in [
+            ("loot", FlourishFamily::Loot),
+            ("high_roll", FlourishFamily::HighRoll),
+            ("stat", FlourishFamily::Stat),
+            ("zone", FlourishFamily::Zone),
+            ("twitch", FlourishFamily::Twitch),
+        ] {
+            assert_eq!(FlourishFamily::parse(key), Some(family));
+        }
+        assert_eq!(FlourishFamily::parse("normal"), None);
+        assert_eq!(FlourishFamily::parse("high-roll"), None);
+
+        assert_eq!(
+            flourish_family(&serde_json::json!({})),
+            FlourishFamily::Loot
+        );
+        assert_eq!(
+            flourish_family(&serde_json::json!({ "high_roll": true })),
+            FlourishFamily::HighRoll
+        );
+        assert_eq!(
+            flourish_family(&serde_json::json!({
+                "high_roll": true,
+                "stat_matches": [{ "stat_id": 70 }]
+            })),
+            FlourishFamily::Stat,
+            "a combined roll/stat item uses the stat position"
+        );
+        assert_eq!(
+            flourish_family(&serde_json::json!({
+                "kind": "zone",
+                "colossal_chest": true
+            })),
+            FlourishFamily::Zone
+        );
+        assert_eq!(
+            flourish_family(&serde_json::json!({ "kind": "twitch" })),
+            FlourishFamily::Twitch
+        );
+    }
+
+    #[test]
+    fn flourish_payload_family_cannot_be_spoofed_by_input_data() {
+        let tagged = tag_flourish_payload(
+            serde_json::json!({ "family": "twitch", "high_roll": true }),
+            FlourishFamily::HighRoll,
+        );
+        assert_eq!(tagged["family"], "high_roll");
+    }
+
+    #[test]
+    fn flourish_positions_use_namespaced_geometry_keys_and_copy_targets() {
+        assert_eq!(FlourishFamily::Loot.position_key(), "flourish:loot");
+        assert_eq!(
+            FlourishFamily::HighRoll.position_key(),
+            "flourish:high_roll"
+        );
+        assert_eq!(FlourishFamily::Stat.position_key(), "flourish:stat");
+        assert_eq!(FlourishFamily::Zone.position_key(), "flourish:zone");
+        assert_eq!(FlourishFamily::Twitch.position_key(), "flourish:twitch");
+
+        assert_eq!(
+            flourish_position_targets(FlourishFamily::Stat, false),
+            vec![FlourishFamily::Stat]
+        );
+        assert_eq!(
+            flourish_position_targets(FlourishFamily::Stat, true),
+            FLOURISH_FAMILIES
+        );
+
+        let position = tauri::PhysicalPosition::new(-1440, 72);
+        assert_eq!(
+            stored_window_position(&position_value(position)),
+            Some(position)
+        );
+        assert!(stored_window_position(&serde_json::json!([i64::MAX, 2])).is_none());
+        assert!(stored_window_position(&serde_json::json!([12])).is_none());
+
+        let legacy = tauri::PhysicalPosition::new(400, 800);
+        let explicit_stat = tauri::PhysicalPosition::new(80, 120);
+        let mut map = serde_json::Map::new();
+        map.insert("flourish".into(), position_value(legacy));
+        map.insert(
+            FlourishFamily::Stat.position_key().into(),
+            position_value(explicit_stat),
+        );
+        seed_flourish_position_values(&mut map);
+        for family in FLOURISH_FAMILIES {
+            let expected = if family == FlourishFamily::Stat {
+                explicit_stat
+            } else {
+                legacy
+            };
+            assert_eq!(
+                map.get(family.position_key())
+                    .and_then(stored_window_position),
+                Some(expected)
+            );
+        }
+
+        let moved = tauri::PhysicalPosition::new(999, 333);
+        set_flourish_position_values(&mut map, FlourishFamily::Twitch, moved, false);
+        assert_eq!(
+            map.get(FlourishFamily::Twitch.position_key())
+                .and_then(stored_window_position),
+            Some(moved)
+        );
+        assert_eq!(
+            map.get(FlourishFamily::Loot.position_key())
+                .and_then(stored_window_position),
+            Some(legacy),
+            "moving one family does not move a family lazily seeded from legacy"
+        );
+    }
+
+    #[test]
+    fn physical_flourish_positions_are_not_settings_export_or_import_data() {
+        let exported = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!exported.contains("flourish_positions"));
+
+        // A short-lived development build wrote this field. It is deliberately
+        // ignored now: replaying a stale exported Settings snapshot must not
+        // move a window or overwrite the dedicated geometry store.
+        let imported: Settings =
+            serde_json::from_str(r#"{"min_tier":5,"flourish_positions":{"twitch":{"x":4,"y":9}}}"#)
+                .unwrap();
+        let reexported = serde_json::to_string(&imported).unwrap();
+        assert_eq!(imported.min_tier, 5);
+        assert!(!reexported.contains("flourish_positions"));
+    }
+
+    #[test]
+    fn older_settings_receive_the_roll_alert_defaults() {
+        let settings: Settings = serde_json::from_str(r#"{"min_tier":5}"#).unwrap();
+        assert_eq!(
+            settings.min_tier, 5,
+            "the setting the file did contain survives"
+        );
+        assert!(settings.high_roll_enabled);
+        assert_eq!(settings.high_roll_threshold, 75);
+        assert!(settings.stat_alert_rules.is_empty());
+        assert!(!settings.debug_mode);
     }
 }

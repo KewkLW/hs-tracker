@@ -31,7 +31,10 @@ pub fn path() -> PathBuf {
 /// against a Windows event or a dump, and an unlabelled clock three hours off
 /// the one in Event Viewer makes that harder, not easier.
 fn stamp() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (days, rest) = (now / 86_400, now % 86_400);
     let (mut year, mut left) = (1970, days);
     loop {
@@ -44,7 +47,20 @@ fn stamp() -> String {
         year += 1;
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0;
     while month < 12 && left >= months[month] {
         left -= months[month];
@@ -70,8 +86,18 @@ pub fn say(level: &str, message: &str) {
         let _ = std::fs::rename(&file, file.with_extension("log.1"));
     }
     let mut line = String::new();
-    let _ = writeln!(line, "{} {:<5} {}", stamp(), level, message.replace('\n', "\n      "));
-    if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+    let _ = writeln!(
+        line,
+        "{} {:<5} {}",
+        stamp(),
+        level,
+        message.replace('\n', "\n      ")
+    );
+    if let Ok(mut out) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)
+    {
         let _ = out.write_all(line.as_bytes());
     }
 }
@@ -118,12 +144,19 @@ pub fn init(version: &str) {
             .map(|s| (*s).to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "a panic with nothing to say".into());
-        let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        let at = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
         let trace = std::backtrace::Backtrace::force_capture();
         say("panic", &format!("{what}\n  at {at}\n{trace}"));
     }));
     say(
         "start",
-        &format!("HS Tracker {version} on {} ({})", std::env::consts::OS, std::env::consts::ARCH),
+        &format!(
+            "HS Tracker {version} on {} ({})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
     );
 }

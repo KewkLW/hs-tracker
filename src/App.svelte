@@ -20,6 +20,12 @@
   let drag = $derived(cfg?.locked ? null : '');
   const urls = {};
   const lastPlayed = {};
+  const TWITCH_DEFAULT_SOUND = {
+    follow: 'heroic', new_sub: 'satanic', resub: 'satanic', sub_gift: 'satanic',
+    bits: 'angelic', power_up: 'angelic', raid: 'zone', outgoing_raid: 'zone',
+    channel_points: 'set', automatic_points: 'set', charity_donation: 'angelic',
+    hype_train: 'satanic', goal: 'set', poll: 'heroic', prediction: 'heroic',
+  };
 
   async function initSounds() {
     cfg = await invoke('get_settings').catch(() => null);
@@ -70,7 +76,9 @@
   // the chip has to be noticed from the corner of an eye during a fight, and
   // anything still moving after that is something the eye learns to ignore.
   let zoneMoved = $state(false);
+  let zoneColossal = $state(false);
   let zoneTimer;
+  let zoneChimeTimer;
   const ZONE_ALERT_MS = 4000;
 
   $effect(() => {
@@ -93,21 +101,47 @@
         mailTimer = setTimeout(() => (mailFresh = false), 20000);
       }),
       listen('item-drop', (e) => playSound(...(Array.isArray(e.payload) ? e.payload : [e.payload]))),
+      listen('twitch-sound', async (e) => {
+        const alert = e.payload ?? {};
+        if (alert.sound === 'none') return;
+        const key = alert.sound && alert.sound !== 'default'
+          ? alert.sound
+          : (TWITCH_DEFAULT_SOUND[alert.event] ?? 'heroic');
+        if (!RARITIES.includes(key)) return;
+        const now = Date.now();
+        if (now - (lastPlayed[`twitch:${key}`] ?? 0) < 150) return;
+        lastPlayed[`twitch:${key}`] = now;
+        urls[key] ??= await soundUrl(key);
+        play(urls[key], Math.min(1, Math.max(0, Number(alert.volume ?? 0.7))));
+      }),
       // The rotation, from the backend, which only says so for a real one —
-      // never for the zone this app has just learned about, and never for one
-      // whose buffs the player did not ask to hear about. That last is decided
-      // there rather than here: the pillar asks the same question, and a rule
-      // written out twice in two languages is a rule that comes to disagree.
+      // never for the zone this app has just learned about, and never for an
+      // ordinary zone whose buffs the player did not ask to hear about. The six
+      // Colossal Chest zones bypass that narrowing. Both decisions live there
+      // rather than here: the pillar asks the same question, and a rule written
+      // out twice in two languages is a rule that comes to disagree.
       //
       // Chime and pulse answer to the one switch: they are two halves of the
       // same alert. The pillar has its own, because being shown and being told
       // are not the same want.
-      listen('zone-changed', () => {
+      listen('zone-changed', (e) => {
         if (cfg?.zone?.enabled === false) return;
+        const colossal = Boolean(e.payload?.colossal_chest);
         playSound('zone');
+        // Reuse the player's chosen zone sound and volume rather than adding a
+        // second sound setting for six rooms. The two-note cadence is unique to
+        // a Colossal Chest rotation, and remains distinct with a custom sound.
+        clearTimeout(zoneChimeTimer);
+        // The built-in chime is just under 1.8 seconds, so this lands as a
+        // second clean note instead of stacking both copies into one loud hit.
+        if (colossal) zoneChimeTimer = setTimeout(() => playSound('zone'), 1900);
         zoneMoved = true;
+        zoneColossal = colossal;
         clearTimeout(zoneTimer);
-        zoneTimer = setTimeout(() => (zoneMoved = false), ZONE_ALERT_MS);
+        zoneTimer = setTimeout(() => {
+          zoneMoved = false;
+          zoneColossal = false;
+        }, ZONE_ALERT_MS);
       }),
       listen('settings-changed', (e) => (cfg = e.payload)),
       listen('strip-hover', (e) => {
@@ -124,6 +158,7 @@
       clearInterval(timer);
       clearTimeout(mailTimer);
       clearTimeout(zoneTimer);
+      clearTimeout(zoneChimeTimer);
       unsubs.forEach((u) => u.then((f) => f()));
     };
   });
@@ -393,9 +428,18 @@
       <div
         class="zone"
         class:moved={zoneMoved}
+        class:colossal={zoneColossal}
         style:background-image="url({art('header')})"
         data-tauri-drag-region={drag}
       >
+        {#if snap?.satanic_zone?.colossal_chest}
+          <img
+            class="zone-chest"
+            src={icon('chest')}
+            alt=""
+            title="This zone contains a native Colossal Chest"
+          />
+        {/if}
         <span class="zone-name" class:here={satanicHere}>
           {snap?.satanic_zone ? zoneName(snap.satanic_zone.zone) : '—'}
         </span>
@@ -731,6 +775,38 @@
     color: #ffb08a;
     animation: zone-pulse 0.55s infinite;
   }
+  /* The six native-chest rooms are the rotation a farmer must not mistake for
+     an ordinary buff hit: gold/cyan instead of satanic red, and the chest stays
+     on the plate after the four-second movement has settled. */
+  .zone.colossal.moved {
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 226, 112, 0.8),
+      inset 0 0 13px rgba(67, 218, 255, 0.38);
+  }
+  .zone.colossal.moved::after {
+    background: linear-gradient(
+      100deg,
+      transparent 24%,
+      rgba(72, 223, 255, 0.52) 43%,
+      rgba(255, 230, 126, 0.72) 52%,
+      transparent 76%
+    );
+  }
+  .zone.colossal.moved .zone-name {
+    color: #ffe67e;
+    text-shadow: 0 1px 0 #000, 0 0 8px rgba(63, 220, 255, 0.9);
+  }
+  .zone-chest {
+    width: 21px;
+    height: 21px;
+    flex: none;
+    margin-right: 5px;
+    image-rendering: pixelated;
+    filter: drop-shadow(0 0 4px rgba(255, 220, 92, 0.65));
+  }
+  .zone.colossal.moved .zone-chest {
+    animation: zone-pulse 0.35s infinite;
+  }
   @keyframes zone-sweep {
     from { transform: translateX(-100%); }
     to { transform: translateX(100%); }
@@ -744,6 +820,7 @@
   @media (prefers-reduced-motion: reduce) {
     .zone.moved::after { animation: none; opacity: 0.25; }
     .zone.moved .zone-name { animation: none; filter: brightness(1.35); }
+    .zone.colossal.moved .zone-chest { animation: none; filter: brightness(1.25); }
   }
 
   .zone-name {

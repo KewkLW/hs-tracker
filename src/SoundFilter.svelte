@@ -3,8 +3,10 @@
   import { art } from './skin.svelte.js';
   import { listen } from './bridge.js';
   import { ITEMS, RARITY_BY_NAME, TIER_BY_NAME, DROP_RATE, tierLabel } from './items.js';
+  import { ITEM_STATS, statLabel } from './item-stats.js';
   import { RARITIES, soundUrl, play } from './audio.js';
   import { ALL_BUFFS } from './buffs.js';
+  import { FLOURISH_FAMILIES } from './flourish-family.js';
 
   // Only named items can be listed: an ordinary base has no identity of its own.
   //
@@ -53,8 +55,37 @@
   let settings = $state(null);
   let selected = $state(0);
   let query = $state('');
+  let statQuery = $state('');
+  let statPickerOpen = $state(false);
+  let editingStatRule = $state(null);
   let status = $state({});
   let saveTimer;
+  let placementError = $state('');
+  let placementErrorTimer;
+
+  // Packet stats are numeric ids. Keep the generated internal key beside the
+  // game's label in the picker: several flat and percent forms have the same
+  // human wording, and a search for either vocabulary should find the one the
+  // player means.
+  const STAT_OPTIONS = ITEM_STATS
+    .map((stat) => ({
+      ...stat,
+      id: Number(stat.id),
+      key: String(stat.key ?? ''),
+      label: String(stat.label || statLabel(stat.id)),
+    }))
+    .filter((stat) => Number.isInteger(stat.id) && stat.id >= 0)
+    .sort((a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key) || a.id - b.id);
+  const STAT_BY_ID = new Map(STAT_OPTIONS.map((stat) => [stat.id, stat]));
+
+  let statMatches = $derived.by(() => {
+    const terms = statQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return STAT_OPTIONS;
+    return STAT_OPTIONS.filter((stat) => {
+      const words = `${stat.label} ${stat.key.replaceAll('_', ' ')} ${stat.id}`.toLowerCase();
+      return terms.every((term) => words.includes(term));
+    });
+  });
 
   // The same five rarities used to be configured in two places — whether they
   // alert at all here, and how loud and with which file one tab away. They are
@@ -231,7 +262,10 @@
         refreshSounds();
       }),
     ];
-    return () => unsubs.forEach((u) => u.then((f) => f()));
+    return () => {
+      clearTimeout(placementErrorTimer);
+      unsubs.forEach((u) => u.then((f) => f()));
+    };
   });
 
   let known = '';
@@ -268,6 +302,123 @@
   }
 
   const id = () => Math.random().toString(36).slice(2, 8);
+
+  function setHighRollThreshold(value) {
+    if (!settings || !Number.isFinite(value)) return;
+    const threshold = Math.min(100, Math.max(0, Math.round(value)));
+    if ((settings.high_roll_threshold ?? 75) === threshold) return;
+    settings.high_roll_threshold = threshold;
+    save();
+  }
+
+  function openStatPicker(ruleId = null) {
+    editingStatRule = ruleId;
+    statQuery = '';
+    statPickerOpen = true;
+  }
+
+  function closeStatPicker() {
+    statPickerOpen = false;
+    editingStatRule = null;
+    statQuery = '';
+  }
+
+  function chooseStat(stat) {
+    if (!settings || !stat) return;
+    if (editingStatRule) {
+      const rule = (settings.stat_alert_rules ?? []).find((candidate) => candidate.id === editingStatRule);
+      if (rule) {
+        rule.stat_id = stat.id;
+        rule.stat = stat.key;
+      }
+    } else {
+      const made = {
+        id: id(),
+        enabled: true,
+        stat: stat.key,
+        stat_id: stat.id,
+        op: '>',
+        value: 0,
+      };
+      settings.stat_alert_rules = [...(settings.stat_alert_rules ?? []), made];
+    }
+    save();
+    closeStatPicker();
+  }
+
+  function removeStatRule(ruleId) {
+    settings.stat_alert_rules = (settings.stat_alert_rules ?? []).filter((rule) => rule.id !== ruleId);
+    if (editingStatRule === ruleId) closeStatPicker();
+    save();
+  }
+
+  function setRuleValue(rule, value) {
+    if (!Number.isFinite(value) || rule.value === value) return;
+    rule.value = value;
+    save();
+  }
+
+  // These go directly to the announcement window. They are deliberately not
+  // fed through the drop pipeline: a visual check must not add a find, move a
+  // counter, play a sound or appear in the journal.
+  function testRollVisual() {
+    const threshold = Math.min(100, Math.max(0, Math.round(settings?.high_roll_threshold ?? 75)));
+    invoke('test_flourish', {
+      preview: {
+        rarity: 'Set',
+        name: "Gladiator's Skullet",
+        tier: 4,
+        item_type: 0,
+        weapon_type: 0,
+        high_roll: true,
+        roll_percent: threshold,
+      },
+    }).catch(() => {});
+  }
+
+  function testStatVisual() {
+    const rules = settings?.stat_alert_rules ?? [];
+    const rule = rules.find((candidate) => candidate.enabled ?? true) ?? {
+      stat_id: 70,
+      stat: 'projectile_speed',
+      op: '>',
+      value: 2,
+    };
+    const op = ['=', '>', '<'].includes(rule.op) ? rule.op : '>';
+    const target = Number.isFinite(Number(rule.value)) ? Number(rule.value) : 0;
+    const actual = op === '>' ? target + 1 : op === '<' ? target - 1 : target;
+    const statId = Number(rule.stat_id);
+    invoke('test_flourish', {
+      preview: {
+        rarity: 'Satanic',
+        name: 'Rift Vectors',
+        tier: 6,
+        item_type: 6,
+        weapon_type: 0,
+        stat_matches: [{
+          stat_id: rule.stat_id != null && Number.isInteger(statId) ? statId : 70,
+          stat: String(rule.stat ?? 'projectile_speed'),
+          actual,
+          op,
+          target,
+        }],
+      },
+    }).catch(() => {});
+  }
+
+  async function placeAlertFamily(family) {
+    clearTimeout(placementErrorTimer);
+    placementError = '';
+    try {
+      await invoke('place_flourish', { placing: true, family });
+    } catch (error) {
+      const detail = typeof error === 'string'
+        ? error
+        : error && typeof error.message === 'string' ? error.message : '';
+      placementError = `Could not open alert placement${detail ? `: ${detail}` : '.'}`;
+      placementErrorTimer = setTimeout(() => (placementError = ''), 8000);
+    }
+  }
 
   // Deleting a filter takes its lists and their sounds with it, and clearing a
   // list is just as final — so anything destructive asks once. The second click
@@ -600,6 +751,10 @@
          on a session with no overlay at all. -->
     <div class="section" style:border-image-source="url({art('chip_dark')})">
       <div class="sechead" data-tauri-drag-region>Zone buffs — which rotations are worth the alert</div>
+      <div class="note warn">
+        Colossal Chest zones always bypass this buff list. When Zone change is enabled, they use
+        a double chime and gold/cyan chest treatment; these picks only narrow ordinary rotations.
+      </div>
       <div class="line">
         <button class="check" onclick={togglePicking} aria-label="narrow the zone alert">
           <img src={pickingOn ? art('check_on') : art('check_off')} alt="" />
@@ -739,19 +894,37 @@
                 Keep its window on screen so OBS can capture it
               </span>
             </div>
-            <div class="line">
-              <button
-                class="btn wide"
-                style:--btn="url({art('button')})"
-                style:--btn-hover="url({art('button_hover')})"
-                style:--btn-down="url({art('button_down')})"
-                onclick={() => invoke('place_flourish', { placing: true })}
-              >
-                Change location
-              </button>
-            </div>
           {/if}
         {/if}
+      </div>
+    {/if}
+
+    {#if canAnnounce}
+      <div class="section alert-locations" style:border-image-source="url({art('chip_dark')})">
+        <div class="sechead" data-tauri-drag-region>Alert locations</div>
+        <div class="note">
+          Each alert family can live in its own place. The placement window previews only the row you choose.
+        </div>
+        {#if placementError}<div class="location-error" role="alert">{placementError}</div>{/if}
+        <div class="location-list">
+          {#each FLOURISH_FAMILIES as family}
+            {#if family.id !== 'twitch' || settings.debug_mode}
+              <div class="location-row">
+                <div class="location-copy">
+                  <span class="location-name">{family.label}</span>
+                  <span class="location-detail">{family.description}</span>
+                </div>
+                <button
+                  class="btn place-btn"
+                  style:--btn="url({art('button')})"
+                  style:--btn-hover="url({art('button_hover')})"
+                  style:--btn-down="url({art('button_down')})"
+                  onclick={() => placeAlertFamily(family.id)}
+                >Drag / place</button>
+              </div>
+            {/if}
+          {/each}
+        </div>
       </div>
     {/if}
 
@@ -760,6 +933,159 @@
 
   <div class="col detail">
   {#if settings}
+    {@const highRollOn = settings.high_roll_enabled ?? true}
+    {@const highRollThreshold = settings.high_roll_threshold ?? 75}
+    <div class="section roll-alerts" style:border-image-source="url({art('chip_dark')})">
+      <div class="alert-head">
+        <div class="sechead" data-tauri-drag-region>Roll alerts — exact stats on pickup</div>
+        <button
+          class="btn add"
+          style:--btn="url({art('button')})"
+          style:--btn-hover="url({art('button_hover')})"
+          style:--btn-down="url({art('button_down')})"
+          title="Show the high-roll alert without recording a drop or playing a sound"
+          onclick={testRollVisual}
+        >Test visual</button>
+      </div>
+      <div class="note warn">
+        Roll alerts fire when the item is picked up; ground packets do not contain stats.
+        High roll ignores fixed stats. Each enabled custom rule is independent — matching any one alerts.
+      </div>
+
+      <div class="line">
+        <button
+          class="check"
+          onclick={() => { settings.high_roll_enabled = !highRollOn; save(); }}
+          aria-label="high roll alerts"
+        >
+          <img src={highRollOn ? art('check_on') : art('check_off')} alt="" />
+        </button>
+        <span class="opt">Alert when every variable stat reaches the threshold</span>
+      </div>
+      <div class="line threshold" class:off={!highRollOn}>
+        <span class="name">All rolls</span>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          disabled={!highRollOn}
+          value={highRollThreshold}
+          oninput={(e) => setHighRollThreshold(e.currentTarget.valueAsNumber)}
+        />
+        <input
+          class="number threshold-number"
+          type="number"
+          min="0"
+          max="100"
+          step="1"
+          disabled={!highRollOn}
+          value={highRollThreshold}
+          aria-label="high roll threshold percentage"
+          oninput={(e) => setHighRollThreshold(e.currentTarget.valueAsNumber)}
+        />
+        <span class="pct suffix">%</span>
+      </div>
+
+      <div class="rulehead">
+        <div>
+          <div class="sechead">Custom stat alerts</div>
+          <div class="note">Values are compared exactly as the item reports them, including fixed stats. Flag values, when sent, use 1 or 0.</div>
+        </div>
+        <div class="rule-actions">
+          <button
+            class="btn add"
+            style:--btn="url({art('button')})"
+            style:--btn-hover="url({art('button_hover')})"
+            style:--btn-down="url({art('button_down')})"
+            title="Show the first enabled custom-stat alert without recording a drop or playing a sound"
+            onclick={testStatVisual}
+          >Test visual</button>
+          <button
+            class="btn add"
+            style:--btn="url({art('button')})"
+            style:--btn-hover="url({art('button_hover')})"
+            style:--btn-down="url({art('button_down')})"
+            aria-expanded={statPickerOpen}
+            onclick={() => statPickerOpen ? closeStatPicker() : openStatPicker()}
+          >{statPickerOpen ? 'Close' : '+ stat alert'}</button>
+        </div>
+      </div>
+
+      {#if statPickerOpen}
+        <div class="stat-popover" style:border-image-source="url({art('chip_dark')})">
+          <div class="picker-title">
+            <span>{editingStatRule ? 'Change the stat' : 'Choose a stat'}</span>
+            <span class="count">{statMatches.length} of {STAT_OPTIONS.length}</span>
+            <button class="del" onclick={closeStatPicker} title="Close stat picker" aria-label="close stat picker">×</button>
+          </div>
+          <input
+            class="field stat-search"
+            style:border-image-source="url({art('chip_dark')})"
+            placeholder="search label, internal name or stat id…"
+            bind:value={statQuery}
+            onkeydown={(e) => {
+              if (e.key === 'Escape') closeStatPicker();
+              if (e.key === 'Enter' && statMatches[0]) chooseStat(statMatches[0]);
+            }}
+          />
+          <div class="stat-options" aria-label="item stats">
+            {#each statMatches as stat (stat.id)}
+              <button class="stat-option" onclick={() => chooseStat(stat)}>
+                <span class="stat-label">{stat.label}</span>
+                <span class="stat-meta">{stat.key || 'unnamed'} · #{stat.id}</span>
+              </button>
+            {:else}
+              <div class="empty compact">No stats match “{statQuery.trim()}”.</div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="stat-rules">
+        {#each settings.stat_alert_rules ?? [] as rule}
+          {@const stat = STAT_BY_ID.get(Number(rule.stat_id))}
+          {@const ruleOn = rule.enabled ?? true}
+          <div class="stat-rule" class:off={!ruleOn}>
+            <button
+              class="check"
+              onclick={() => { rule.enabled = !ruleOn; save(); }}
+              aria-label="toggle {statLabel(rule.stat_id)} alert"
+            >
+              <img src={ruleOn ? art('check_on') : art('check_off')} alt="" />
+            </button>
+            <button class="stat-choice" onclick={() => openStatPicker(rule.id)} title="Change this stat">
+              <span class="stat-label">{stat?.label ?? statLabel(rule.stat_id)}</span>
+              <span class="stat-meta">{stat?.key || `stat #${rule.stat_id}`}</span>
+            </button>
+            <select
+              class="picker op-picker"
+              value={['=', '>', '<'].includes(rule.op) ? rule.op : '>'}
+              aria-label="comparison for {statLabel(rule.stat_id)}"
+              onchange={(e) => { rule.op = e.currentTarget.value; save(); }}
+            >
+              <option value="=">=</option>
+              <option value=">">&gt;</option>
+              <option value="<">&lt;</option>
+            </select>
+            <input
+              class="number target"
+              type="number"
+              step="any"
+              value={Number.isFinite(Number(rule.value)) ? Number(rule.value) : 0}
+              aria-label="target value for {statLabel(rule.stat_id)}"
+              oninput={(e) => setRuleValue(rule, e.currentTarget.valueAsNumber)}
+            />
+            <button class="del" onclick={() => removeStatRule(rule.id)} title="Delete this stat alert" aria-label="delete stat alert">×</button>
+          </div>
+        {:else}
+          {#if !statPickerOpen}
+            <div class="empty compact">No custom stat alerts yet.</div>
+          {/if}
+        {/each}
+      </div>
+    </div>
+
     <div class="section" style:border-image-source="url({art('chip_dark')})">
       <div class="sechead" data-tauri-drag-region>Custom filter — a sound of its own for the items you name</div>
 
@@ -1168,6 +1494,37 @@
 
   .btn.wide { width: 100%; max-width: 380px; }
 
+  .location-list { display: flex; flex-direction: column; gap: 3px; }
+  .location-row {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 3px 4px;
+    background: rgba(0, 0, 0, 0.14);
+    border: 1px solid rgba(61, 42, 44, 0.55);
+  }
+  .location-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .location-name { color: var(--bone-9); font-size: 11px; }
+  .location-detail {
+    min-width: 0;
+    color: var(--dim-2);
+    font-size: 9px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .place-btn { min-width: 76px; }
+  .location-error {
+    padding: 4px 6px;
+    color: #ffb6a6;
+    font-size: 10px;
+    line-height: 1.3;
+    background: rgba(88, 15, 12, 0.34);
+    border: 1px solid rgba(216, 83, 65, 0.52);
+  }
+
   /* a setting that is on but cannot act yet says so where it is set */
   .note.warn { color: var(--gold, #e8c860); }
   .vol { width: 100%; min-width: 44px; }
@@ -1489,6 +1846,156 @@
     font-size: 10px;
     padding: 2px 6px;
   }
+
+  .roll-alerts { gap: 5px; }
+  .alert-head,
+  .rule-actions {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .alert-head { justify-content: space-between; }
+  .rule-actions { flex: none; }
+  .threshold.off,
+  .stat-rule.off { opacity: 0.48; }
+  .threshold .name { width: 72px; }
+  .threshold input[type='range'] { min-width: 70px; }
+  .threshold .suffix {
+    width: auto;
+    margin-left: -4px;
+  }
+
+  /* Number inputs are taken over for the same reason as the selects: native
+     WebKit and WebView2 otherwise make this one row look like two applications
+     stitched together. The spinner remains available for exact adjustments. */
+  .number {
+    box-sizing: border-box;
+    height: 24px;
+    min-width: 0;
+    font: inherit;
+    font-size: 11px;
+    color: var(--bone-13);
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--ground-10);
+    border-radius: 0;
+    outline: none;
+    padding: 2px 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .number:hover,
+  .number:focus { border-color: var(--edge-4); }
+  .number:disabled { opacity: 0.45; }
+  .threshold-number { flex: none; width: 56px; text-align: right; }
+
+  .rulehead,
+  .picker-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .rulehead {
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px solid var(--ground-10);
+  }
+  .rulehead > div { min-width: 0; }
+
+  .stat-popover {
+    box-sizing: border-box;
+    border: 6px solid transparent;
+    border-image-slice: 6 fill;
+    border-image-width: 6px;
+    image-rendering: pixelated;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 2px 4px 4px;
+  }
+  .picker-title {
+    color: var(--edge-2b);
+    font-size: 10px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+  .picker-title .count { margin-left: auto; color: var(--edge-5); }
+  .stat-search { width: 100%; flex: none; }
+  .stat-options {
+    max-height: 190px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding-right: 2px;
+  }
+  .stat-options::-webkit-scrollbar { width: 6px; }
+  .stat-options::-webkit-scrollbar-thumb { background: var(--dim-1); border-radius: 3px; }
+  .stat-option,
+  .stat-choice {
+    min-width: 0;
+    font: inherit;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.18);
+    border: none;
+    cursor: pointer;
+    text-align: left;
+  }
+  .stat-option {
+    flex: none;
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(100px, 1fr);
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 6px;
+  }
+  .stat-option:nth-child(even) { background: rgba(0, 0, 0, 0.08); }
+  .stat-option:hover,
+  .stat-choice:hover { background: rgba(150, 37, 56, 0.35); }
+  .stat-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stat-meta {
+    min-width: 0;
+    color: var(--edge-2b);
+    font-size: 9px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stat-option .stat-meta { text-align: right; }
+
+  .stat-rules {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .stat-rule {
+    display: grid;
+    grid-template-columns: 18px minmax(112px, 1fr) 48px 78px 18px;
+    align-items: center;
+    gap: 5px;
+    min-height: 30px;
+    padding: 1px 2px;
+    background: rgba(0, 0, 0, 0.14);
+  }
+  .stat-choice {
+    display: flex;
+    flex-direction: column;
+    padding: 3px 5px;
+  }
+  .stat-choice .stat-label { width: 100%; font-size: 11px; }
+  .stat-choice .stat-meta { width: 100%; }
+  .op-picker {
+    width: 48px;
+    flex: none;
+    padding-left: 7px;
+    background-position: calc(100% - 10px) 50%, calc(100% - 5px) 50%;
+  }
+  .target { width: 78px; text-align: right; }
+  .empty.compact { padding: 6px 4px; }
 
   .empty {
     color: var(--dim-2);

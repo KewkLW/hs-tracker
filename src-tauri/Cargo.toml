@@ -40,6 +40,12 @@ etherparse = "0.16"
 netstat2 = "0.11"
 sysinfo = "0.33"
 discord-rich-presence = "1.1.0"
+# Twitch is outbound-only: blocking HTTP for OAuth/Helix and one blocking
+# EventSub WebSocket worker. Public Device Code OAuth means no client secret is
+# shipped; rotating tokens live in the platform credential vault.
+reqwest = { version = "0.13", features = ["blocking", "json", "form", "query"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+keyring = "4.1.6"
 
 # autostart is a registry value on Windows and a .desktop file elsewhere
 [target.'cfg(windows)'.dependencies]

@@ -6,6 +6,8 @@
   import Runs from './Runs.svelte';
   import Shop from './Shop.svelte';
   import SoundFilter from './SoundFilter.svelte';
+  import FxLab from './FxLab.svelte';
+  import Twitch from './Twitch.svelte';
   import Settings from './Settings.svelte';
   import About from './About.svelte';
   import Codex from './Codex.svelte';
@@ -25,6 +27,8 @@
     { id: 'stats', label: 'Statistics', component: Stats },
     { id: 'runs', label: 'Runs', component: Runs },
     { id: 'filter', label: 'Alerts', component: SoundFilter },
+    { id: 'fx', label: 'FX', component: FxLab, debug: true },
+    { id: 'twitch', label: 'Twitch', component: Twitch, debug: true },
     { id: 'codex', label: 'Items', component: Codex },
     { id: 'shop', label: 'Shopping List', component: Shop },
     { id: 'settings', label: 'Settings', component: Settings },
@@ -46,9 +50,48 @@
     SECTIONS.some((s) => s.id === remembered) ? remembered : 'stats'
   );
 
+  // FX and Twitch are still experimental. The backend owns this preference as
+  // `debug_mode`; until its first settings reply, the safe assumption is off so
+  // neither tab nor either heavy component flashes into view on startup.
+  let debugMode = $state(false);
+  let debugReady = $state(false);
+  let visibleSections = $derived(
+    SECTIONS.filter((candidate) => !candidate.debug || (debugReady && debugMode)),
+  );
+
+  $effect(() => {
+    let settingsEventSeen = false;
+    let disposed = false;
+    const apply = (value) => {
+      if (disposed) return;
+      debugMode = Boolean(value?.debug_mode);
+      debugReady = true;
+    };
+    invoke('get_settings')
+      .then((value) => { if (!settingsEventSeen) apply(value); })
+      .catch(() => { if (!settingsEventSeen) apply(null); });
+    const unsub = listen('settings-changed', (event) => {
+      settingsEventSeen = true;
+      apply(event.payload);
+    });
+    return () => {
+      disposed = true;
+      unsub.then((stop) => stop());
+    };
+  });
+
+  // A settings import can turn Debug Mode off while one of these panels is on
+  // screen. Render the normal Statistics page immediately, then repair both
+  // the selected state and the remembered section.
+  $effect(() => {
+    if (!debugReady) return;
+    if (!visibleSections.some((candidate) => candidate.id === section)) section = 'stats';
+  });
+
   // the backend pushes the heavy statistics payload only while it is the
   // section on screen, so it has to be told which one that is
   $effect(() => {
+    if (!debugReady || !visibleSections.some((candidate) => candidate.id === section)) return;
     remember('section', section);
     invoke('viewing', { section }).catch(() => {});
   });
@@ -61,7 +104,7 @@
       .catch(() => {});
   });
 
-  let Current = $derived((SECTIONS.find((s) => s.id === section) ?? SECTIONS[0]).component);
+  let Current = $derived((visibleSections.find((s) => s.id === section) ?? visibleSections[0]).component);
 
   // Why the numbers are not moving, said out loud. The overlay has always had a
   // coloured dot with a tooltip for this; on a Wayland session there is no
@@ -220,7 +263,7 @@
 
   <div class="body">
     <nav class="nav" data-tauri-drag-region>
-      {#each SECTIONS as s}
+      {#each visibleSections as s}
         <button class="tab" class:on={s.id === section} onclick={() => (section = s.id)}>{s.label}</button>
       {/each}
 

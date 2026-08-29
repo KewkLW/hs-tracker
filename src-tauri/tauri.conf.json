@@ -79,7 +79,7 @@
       "icons/icon.png"
     ],
     "shortDescription": "Hero Siege session tracker overlay",
-    "longDescription": "A session overlay for Hero Siege. It shows gold, experience, kills and every drop worth hearing about on top of the game, and reads them from the game's own network traffic — nothing is injected, no memory is read and nothing is sent anywhere.",
+    "longDescription": "A session overlay for Hero Siege. It shows gold, experience, kills and important alerts on top of the game, and reads Hero Siege data from the game's own network traffic — nothing is injected and no game memory is read. Optional Discord and Twitch features connect only when enabled.",
     "category": "Game",
     "license": "MIT",
     "copyright": "Copyright (c) 2026 HS Tracker contributors",

@@ -4872,11 +4872,17 @@ pub fn item_name(item_type: i64, id: i64, weapon_type: i64) -> Option<&'static s
 }
 
 fn lookup(item_type: i64, id: i64, weapon_type: i64) -> Option<&'static str> {
-    if !(0..256).contains(&item_type) || !(0..65536).contains(&id) || !(0..256).contains(&weapon_type) {
+    if !(0..256).contains(&item_type)
+        || !(0..65536).contains(&id)
+        || !(0..256).contains(&weapon_type)
+    {
         return None;
     }
     let key = ((item_type as u32) << 24) | ((id as u32) << 8) | weapon_type as u32;
-    ITEMS.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| ITEMS[i].1)
+    ITEMS
+        .binary_search_by_key(&key, |(k, _)| *k)
+        .ok()
+        .map(|i| ITEMS[i].1)
 }
 
 /// Rarity of a named item; names are matched lowercased.
@@ -5052,5 +5058,8 @@ static ROOMS: [(&str, &str); 143] = [
 /// zones correctly and everything else not at all — `Shadow_Realm_rm` came
 /// out as "Shadow Realm rm", suffix and all, in the Discord presence.
 pub fn room_name(room: &str) -> Option<&'static str> {
-    ROOMS.binary_search_by_key(&room, |(k, _)| *k).ok().map(|i| ROOMS[i].1)
+    ROOMS
+        .binary_search_by_key(&room, |(k, _)| *k)
+        .ok()
+        .map(|i| ROOMS[i].1)
 }

@@ -51,6 +51,8 @@ feature explanation.
 | **Statistics** | Gold, xp and kills per hour, drops by rarity, magic find, bosses and chests, what rolls better in the zone you are standing in, and the Satanic Zone with a countdown to the next rotation. |
 | **Alerts** | One page: a sound per rarity, the grade a drop must reach, named lists of specific items with sounds of their own, the satanic zone rotating, and the announcement — all set side by side rather than three tabs apart. Alerts fire the moment an item hits the ground. |
 | **Announcement** | A drop lands and the game's own loot pillar plays over the screen, wherever you have put it. It can follow the rarity switches or simply announce whatever your custom filter lists. |
+| **FX Lab (experimental)** | A Debug Mode preview for building announcement looks live. It stays hidden and has no effect on normal alerts unless Debug Mode is enabled. |
+| **Twitch (experimental)** | A Debug Mode preview of native Twitch EventSub alerts. It remains disconnected and unavailable in the normal app while the integration is being finished. |
 | **Satanic Zone** | The rotation gets a chime and an announcement of its own — a rift that opens across the screen with the new zone and the buffs it rolled, drawn so it is never mistaken for a drop. Tick the buffs worth leaving a fight for and the rest pass in silence; tick none and every rotation is announced. |
 | **Items** | Every named item, its drop chance, and the places it rolls better in. Search by name, rarity or kind. |
 | **Runs** | Every finished session kept — the rates, the finds, where the time went. **Copy card** turns one into a picture you can paste into a chat. |
@@ -82,12 +84,16 @@ not the ones on the wire, and nothing is counted at all. **Read every
 connection** in Settings takes the filter off for those machines. That widens
 what is read on your own machine and changes nothing else.
 
-Nothing is sent anywhere; every number stays where it was counted. Two things
-leave the machine, both only if you ask for them: the **About** section's update
+Every Hero Siege number stays where it was counted. Three opt-in features make
+outside connections: the **About** section's update
 check, which asks GitHub for the newest release when you press the button, and
 Discord rich presence, which hands the zone, the drop count and the session
-clock to the Discord client while it is switched on. It is off until you turn it
-on.
+clock to the Discord client while it is switched on. The experimental Twitch
+alert engine is available only in Debug Mode and connects directly to Twitch
+OAuth, Helix and EventSub only after you enable and authorize it there. Twitch
+tokens stay in the operating-system credential vault and are never placed in
+settings or an exported backup. Discord and Twitch are both off until you turn
+them on.
 
 ## Showcase
 
