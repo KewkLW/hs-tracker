@@ -26,6 +26,10 @@ pub const RARITIES: &[(&str, &str)] = &[
 
 pub const JOURNAL_RARITIES: &[&str] = &["Satanic", "Set", "Heroic", "Angelic", "Unholy"];
 
+/// Relics are an item category, not a rarity. The tables correctly call every
+/// one Common, so their sound must follow the packet's item type.
+const RELIC_ITEM_TYPE: i64 = 16;
+
 /// The top grade an item can carry, and the one number a farmer judges a run by:
 /// how many chase items it produced, whatever colour they came out. Grades run
 /// 1..6 and the interface writes them D, C, B, A, S, SS.
@@ -676,6 +680,8 @@ pub struct Prefs {
     pub fx_tier: i64,
     /// announce anything the custom filter's lists match, whatever its rarity
     pub fx_listed: bool,
+    /// Sound for item type 16 even though its actual rarity is Common.
+    pub relic_alert: bool,
     pub high_roll_enabled: bool,
     pub high_roll_threshold: u8,
     pub stat_alert_rules: Vec<StatAlertRule>,
@@ -696,6 +702,7 @@ impl Default for Prefs {
             fx_rarities: Vec::new(),
             fx_tier: 6,
             fx_listed: false,
+            relic_alert: true,
             high_roll_enabled: true,
             high_roll_threshold: 75,
             stat_alert_rules: Vec::new(),
@@ -1325,6 +1332,12 @@ impl GameStats {
     }
 
     #[cfg(test)]
+    pub fn set_relic_alert(&mut self, enabled: bool) {
+        self.revision += 1;
+        self.prefs.relic_alert = enabled;
+    }
+
+    #[cfg(test)]
     pub fn set_sound_lists(&mut self, lists: Vec<(String, Vec<String>)>) {
         self.revision += 1;
         self.prefs.sound_lists = lists
@@ -1899,12 +1912,13 @@ impl GameStats {
                 // a list the user built outranks every switch below it
                 let listed = self.listed_sound(name);
                 let listed_hit = listed.is_some();
+                let relic_hit = self.prefs.relic_alert && *item_type == RELIC_ITEM_TYPE;
                 let wanted = *announced || listed_hit || self.prefs.prefer_ground || !*ground;
                 let announce = *announced
                     || listed_hit
                     || (!is_resource && self.passes_filter(&rarity_key, tier));
                 let flourish = !is_resource && self.worth_a_flourish(&rarity_key, tier, listed_hit);
-                if wanted && (announce || flourish || special) {
+                if wanted && (announce || flourish || special || relic_hit) {
                     // One item, one notification, whichever sighting got here
                     // first. The rule above says as much, but a list was
                     // exempt from it — `wanted` is true for a listed item
@@ -1932,19 +1946,20 @@ impl GameStats {
                         // not a newly verified roll alert. Exact values were not
                         // in the chat line, so the pickup is new information.
                         if *announced || !echo {
-                            // Only what the alert rules asked for chimes. A drop
-                            // that got this far on the flourish's rules alone is
-                            // a picture, not a sound. A roll-alert follow-up is
-                            // also visual-only when the ground already chimed.
-                            let sound = if echo || !announce {
+                            // Only what the alert rules asked for chimes, plus
+                            // the separate relic category. Flourish-only and
+                            // roll-alert follow-ups remain visual-only.
+                            let sound = if echo || (!announce && !relic_hit) {
                                 None
                             } else {
-                                listed.or_else(|| {
-                                    self.prefs
-                                        .alerts
-                                        .contains(&rarity_key)
-                                        .then(|| rarity_key.to_lowercase())
-                                })
+                                listed
+                                    .or_else(|| relic_hit.then(|| "relic".into()))
+                                    .or_else(|| {
+                                        self.prefs
+                                            .alerts
+                                            .contains(&rarity_key)
+                                            .then(|| rarity_key.to_lowercase())
+                                    })
                             };
                             let entry = DropEntry {
                                 ts_ms: now_ms(),
@@ -2425,6 +2440,63 @@ mod tests {
             ground: false,
             rolls: Default::default(),
         }
+    }
+
+    fn jungle_vial(fingerprint: &str, ground: bool) -> GameEvent {
+        GameEvent::ItemAdded {
+            // The packet may claim something higher; the table correctly
+            // overrides it with Common/D while the category supplies sound.
+            rarity: json!(7),
+            unscaled: false,
+            mf: false,
+            tier: 0,
+            item_type: RELIC_ITEM_TYPE,
+            item_id: 127,
+            weapon_type: 0,
+            seed: 1,
+            name: "Jungle Vial".into(),
+            announced: false,
+            amount: 1,
+            fingerprint: fingerprint.into(),
+            hash: String::new(),
+            ground,
+            rolls: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_relic_owns_sound_without_changing_its_rarity() {
+        let mut s = GameStats::default();
+        s.set_filter(vec![], 6);
+
+        let relic = s.apply(&jungle_vial("relic-1", false)).expect("relic sound");
+        assert_eq!(relic.sound.as_deref(), Some("relic"));
+        assert_eq!((relic.rarity.as_str(), relic.tier), ("Common", 1));
+        assert!(!relic.announce, "the rarity journal remains unchanged");
+        assert!(s.extra().drops.is_empty(), "a sound-only relic is not journalled");
+
+        let mut off = GameStats::default();
+        off.set_filter(vec![], 0);
+        off.set_relic_alert(false);
+        assert!(off.apply(&jungle_vial("relic-2", false)).is_none());
+    }
+
+    #[test]
+    fn relic_sound_respects_timing_and_custom_lists() {
+        let mut on_pickup = GameStats::default();
+        on_pickup.set_filter(vec![], 6);
+        on_pickup.set_prefer_ground(false);
+        assert!(on_pickup.apply(&jungle_vial("relic-3", true)).is_none());
+        let pickup = on_pickup
+            .apply(&jungle_vial("relic-3", false))
+            .expect("the same relic sounds on pickup");
+        assert_eq!(pickup.sound.as_deref(), Some("relic"));
+
+        let mut listed = GameStats::default();
+        listed.set_filter(vec![], 6);
+        listed.set_sound_lists(vec![("list-relics".into(), vec!["Jungle Vial".into()])]);
+        let chosen = listed.apply(&jungle_vial("relic-4", false)).expect("listed relic");
+        assert_eq!(chosen.sound.as_deref(), Some("list-relics"));
     }
 
     fn tiered_satanic(tier: i64, fingerprint: &str) -> GameEvent {

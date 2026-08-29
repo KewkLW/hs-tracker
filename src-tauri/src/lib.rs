@@ -21,8 +21,8 @@ use tauri::{AppHandle, Emitter, LogicalSize, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 /// Alert kinds that own a configurable sound (not item rarities — see stats).
-const SOUND_KEYS: [&str; 7] = [
-    "satanic", "set", "heroic", "angelic", "unholy", "mail", "zone",
+const SOUND_KEYS: [&str; 8] = [
+    "satanic", "set", "heroic", "angelic", "unholy", "relic", "mail", "zone",
 ];
 
 /// A sound is either one of the built-in alerts or a list's own file,
@@ -367,6 +367,8 @@ pub struct Settings {
     pub heroic: SoundCfg,
     pub angelic: SoundCfg,
     pub unholy: SoundCfg,
+    /// Relics are Common, so their item category owns a separate channel.
+    pub relic: SoundCfg,
     pub mail: SoundCfg,
     /// The satanic zone rotating: its chime, its volume, and — because the two
     /// are one decision — whether the overlay's zone chip pulses with it.
@@ -500,6 +502,7 @@ impl Default for Settings {
             heroic: SoundCfg::default(),
             angelic: SoundCfg::default(),
             unholy: SoundCfg::default(),
+            relic: SoundCfg::default(),
             mail: SoundCfg::default(),
             // On out of the box: the zone moving is the one thing on this panel
             // the player is meant to act on, and it happens while they are
@@ -1697,6 +1700,7 @@ fn apply_stats_settings(app: &AppHandle, settings: &Settings) {
         },
         fx_tier: settings.flourish_tier.clamp(1, 6),
         fx_listed: settings.flourish && settings.flourish_listed && settings.use_filter,
+        relic_alert: settings.relic.enabled,
         high_roll_enabled: settings.high_roll_enabled,
         high_roll_threshold: settings.high_roll_threshold.min(100),
         stat_alert_rules: settings
@@ -1974,6 +1978,7 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<(), String> {
         &mut settings.heroic,
         &mut settings.angelic,
         &mut settings.unholy,
+        &mut settings.relic,
         &mut settings.mail,
         &mut settings.zone,
     ] {
@@ -4211,6 +4216,7 @@ mod tests {
             "heroic",
             "angelic",
             "unholy",
+            "relic",
             "mail",
             "zone",
             "list-9f3a2b",

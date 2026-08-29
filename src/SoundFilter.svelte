@@ -109,6 +109,7 @@
   }
 
   let mailVolume = $derived(Math.round((settings?.mail?.volume ?? 0.7) * 100));
+  let relicVolume = $derived(Math.round((settings?.relic?.volume ?? 0.7) * 100));
   let zoneVolume = $derived(Math.round((settings?.zone?.volume ?? 0.7) * 100));
 
   // The announcement lives here rather than in Settings: it answers the same
@@ -632,7 +633,7 @@
   <div class="col rules">
   {#if settings}
     <div class="section" style:border-image-source="url({art('chip_dark')})">
-      <div class="sechead" data-tauri-drag-region>Rarity alerts — what makes a sound at all</div>
+      <div class="sechead" data-tauri-drag-region>Sound alerts — what makes a sound at all</div>
       {#each ALERT_RARITIES as rarity}
         {@const key = SOUND_KEY[rarity]}
         {@const on = (settings.alerts ?? []).includes(rarity)}
@@ -669,6 +670,38 @@
           </div>
         </div>
       {/each}
+
+      <!-- Relic is an item category, not a rarity. Every relic is Common and
+           D-graded, so the backend follows item type 16 instead. -->
+      <div class="rrow" class:off={!settings.relic?.enabled}>
+        <button class="check" onclick={() => { settings.relic.enabled = !settings.relic.enabled; save(); }} aria-label="relic">
+          <img src={settings.relic?.enabled ? art('check_on') : art('check_off')} alt="" />
+        </button>
+        <span class="rname c-relic" title="Every relic drop, identified by its item category rather than its Common rarity">Relic</span>
+        <input
+          class="vol"
+          type="range"
+          min="0"
+          max="100"
+          disabled={!settings.relic?.enabled}
+          value={relicVolume}
+          oninput={(e) => setVolume('relic', e.currentTarget.value / 100)}
+        />
+        <span class="pct">{relicVolume}%</span>
+        <span class="src" title={custom.relic ? `sounds/${custom.relic}` : 'built-in sound'}>{custom.relic ?? 'built-in'}</span>
+        <div class="rbtns">
+          <button class="btn sm" style:--btn="url({art('button')})" style:--btn-hover="url({art('button_hover')})" style:--btn-down="url({art('button_down')})" onclick={() => testRarity('relic')}>Test</button>
+          <button class="btn sm" style:--btn="url({art('button')})" style:--btn-hover="url({art('button_hover')})" style:--btn-down="url({art('button_down')})" onclick={() => pickRaritySound('relic')}>Browse…</button>
+          <button
+            class="btn sm"
+            style:--btn="url({art('button')})"
+            style:--btn-hover="url({art('button_hover')})"
+            style:--btn-down="url({art('button_down')})"
+            disabled={!custom.relic}
+            onclick={() => danger('snd-relic', () => invoke('clear_sound', { rarity: 'relic' }).catch(() => {}))}
+          >{armed === 'snd-relic' ? 'Sure?' : 'Default'}</button>
+        </div>
+      </div>
 
       <!-- not a drop, but it is a sound and it lived on the tab that went away -->
       <div class="rrow" class:off={!settings.mail?.enabled}>
@@ -2037,6 +2070,7 @@
   .c-her { color: #35d3c1; }
   .c-ang { color: var(--gold-1); }
   .c-unh { color: #e04a7a; }
+  .c-relic { color: #bd8cff; }
   /* The rotation is not a rarity, and wearing the satanic red said it was —
      one more colour in a column of five that all mean "an item this good".
      This is the peach the announcement writes SATANIC ZONE in, which nothing

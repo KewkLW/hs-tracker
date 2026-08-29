@@ -9,10 +9,10 @@ import unholyWav from './assets/sounds/unholy.wav';
 import mailWav from './assets/sounds/mail.wav';
 import zoneMp3 from './assets/sounds/zone.mp3';
 
-/// Every key that owns a sound of its own. Two of them are not rarities at all
-/// — the mail chime and the satanic zone rotating — and they are on this list
-/// because everything that loads, tests or replaces a sound walks it.
-export const RARITIES = ['satanic', 'set', 'heroic', 'angelic', 'unholy', 'mail', 'zone'];
+/// Every key that owns a sound of its own. Three of them are not rarities at
+/// all — relics, the mail chime and the satanic zone rotating — and they are on
+/// this list because everything that loads, tests or replaces a sound walks it.
+export const RARITIES = ['satanic', 'set', 'heroic', 'angelic', 'unholy', 'relic', 'mail', 'zone'];
 
 export const DEFAULTS = {
   satanic: satanicWav,
@@ -20,6 +20,9 @@ export const DEFAULTS = {
   heroic: heroicWav,
   angelic: angelicWav,
   unholy: unholyWav,
+  // Relics own a separately replaceable channel. Reuse the short Heroic cue
+  // as its bundled default instead of adding another binary sound asset.
+  relic: heroicWav,
   mail: mailWav,
   // The rotation gets a sound of its own rather than borrowing the satanic
   // chime it used to: the two mean different things and were told apart only by
